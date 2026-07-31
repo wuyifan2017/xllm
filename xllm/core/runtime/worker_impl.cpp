@@ -57,9 +57,11 @@ limitations under the License.
 #include "core/platform/sleepable_allocator.h"
 #if defined(USE_NPU)
 #include "platform/npu/device_capture_lock.h"
-#elif defined(USE_CUDA) || defined(USE_DCU)
-#include "kernels/cuda/cuda_ops_api.h"
+#elif defined(USE_CUDA) || defined(USE_DCU) || defined(USE_MUSA)
 #include "platform/torch_profiler.h"
+#endif
+#if defined(USE_CUDA) || defined(USE_DCU)
+#include "kernels/cuda/cuda_ops_api.h"
 #endif
 #if defined(USE_CUDA)
 #include "platform/cuda_profiler.h"
@@ -1197,7 +1199,7 @@ bool WorkerImpl::start_profile() {
     // Capture-range only; requires the server to run under nsys.
     return CudaProfiler::get_instance().start();
   }
-#elif defined(USE_DCU)
+#elif defined(USE_DCU) || defined(USE_MUSA)
   // Default "torch" backend records in-process via Kineto. CPU-op capture uses
   // thread-local callbacks, so enable it on the compute thread that runs the
   // forward pass rather than on the RPC handler thread.
@@ -1220,7 +1222,7 @@ bool WorkerImpl::stop_profile() {
   if (cfg.profile_backend() == "cuda") {
     return CudaProfiler::get_instance().stop();
   }
-#elif defined(USE_DCU)
+#elif defined(USE_DCU) || defined(USE_MUSA)
   const std::string profile_dir = cfg.profile_dir();
   const int32_t rank = parallel_args_.rank();
   folly::Promise<bool> promise;

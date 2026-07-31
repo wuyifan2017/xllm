@@ -133,7 +133,12 @@ void WorkerServer::create_server(const runtime::Options& options,
   //    std::make_unique<WorkerServiceImpl>(worker_impl);
   auto worker_service = std::make_shared<WorkerService>(options, device);
 
-  auto addr = net::get_local_ip_addr();
+  std::string addr = net::get_route_ip(master_node_addr);
+  if (addr.empty()) {
+    LOG(ERROR) << "Failed to select a local address for master "
+               << master_node_addr;
+    return;
+  }
   auto worker_server =
       ServerRegistry::get_instance().register_server(server_name_);
   if (!worker_server->start(worker_service, addr + ":0")) {

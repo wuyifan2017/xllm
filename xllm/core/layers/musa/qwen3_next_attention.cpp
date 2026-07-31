@@ -240,10 +240,9 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
     //     output buffer slice in place; the next layer's attn_->forward
     //     overwrites that slot before any other consumer reads it.
     // Both ops are pure elementwise kernels with no host-side allocation.
-    // Neither sglang nor xllm-musa fuses this on torch_musa; sglang relies
-    // on libtorch's MemPoolContext-aware allocator (not honoured by
-    // torch_musa 2.7.1) to put the implicit allocations in the captured
-    // pool, so on this stack we have to bypass them entirely.
+    // torch_musa does not fuse this path; libtorch's MemPoolContext-aware
+    // allocator is not honoured by torch_musa 2.7.1 for captured pools, so
+    // on this stack we bypass the implicit allocations entirely.
     out.mul_(gate.sigmoid_());
 #else
     out = out * torch::sigmoid(gate);

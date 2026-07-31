@@ -7,6 +7,7 @@ cc_test(
     blocking_counter_test.cpp
     device_name_utils_test.cpp
     http_downloader_test.cpp
+    net_test.cpp
     suffix_decoding_cache_test.cpp
     threadpool_test.cpp
     vocab_validation_test.cpp

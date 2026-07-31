@@ -384,7 +384,7 @@ void FlashInferAttentionImpl::decoder_forward(
       seqused_k = seqused_k.contiguous();
 
       // page_table: native rectangular block_table built by the input builder
-      // from allocated KV blocks (sglang req_to_token style). Unused slots are
+      // from allocated KV blocks. Unused slots are
       // -1; graph mode reuses persistent_block_tables_ updated each step.
       const torch::Tensor page_table = attn_metadata.block_table;
 
