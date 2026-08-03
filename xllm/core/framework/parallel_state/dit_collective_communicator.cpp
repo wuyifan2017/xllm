@@ -95,7 +95,7 @@ ProcessGroup* DiTCollectiveCommunicator::create_process_group_by_type(
     std::unique_ptr<ProcessGroup>& member_group,
     const torch::Device& device) {
   int32_t group_size = parallel_args_->get_group_size_by_type(group_type);
-  if (group_size > 1 && dit_mapping_) {
+  if (dit_mapping_) {
     auto parallel_info = dit_mapping_->get_parallel_info(group_type);
     auto group_id = parallel_info.current_group_id();
     auto num_group = parallel_info.num_group();
