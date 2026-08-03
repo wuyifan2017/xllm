@@ -395,6 +395,12 @@ void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates);
 
+void reshape_and_cache_a5(const torch::Tensor& key,
+                          const torch::Tensor& value,
+                          torch::Tensor& key_cache,
+                          torch::Tensor& value_cache,
+                          const torch::Tensor& slot_mapping);
+
 std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     torch::Tensor& q,
     torch::Tensor& k,
