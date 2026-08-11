@@ -79,14 +79,19 @@ int64_t index_slot_size(const ModelArgs& model_args,
   }
 
   const int64_t index_n_head = 1;
+  int64_t split_factor = 1;
+  if (Platform::supports_dsa_indexer_cache_sharding() &&
+      util::kv_split_size_effective() > 1) {
+    split_factor = util::kv_split_size_effective();
+  }
   if (enable_indexer_cache_quantization) {
     // int8 index cache: one byte per element, plus an independent per-token
     // fp32 scale (kept separate from the main-KV scale_slot_size path).
-    return static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
-               model_args.index_head_dim() +
-           static_cast<int64_t>(sizeof(float));
+    return split_factor * (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
+                               model_args.index_head_dim() +
+                           static_cast<int64_t>(sizeof(float)));
   }
-  return dtype_size * index_n_head * model_args.index_head_dim();
+  return split_factor * dtype_size * index_n_head * model_args.index_head_dim();
 }
 
 int64_t scale_slot_size(const ModelArgs& model_args,
@@ -115,12 +120,6 @@ int64_t standard_full_cache_block_size_in_bytes(
        indexer_layers * kv_cache_cap.index_slot_size());
   CHECK_GT(logical_block_bytes, 0) << "logical block bytes must be positive";
   return logical_block_bytes;
-}
-
-bool is_qwen3_5_target_model_type(const std::string& model_type) {
-  return model_type == "qwen3_5" || model_type == "qwen3_5_moe" ||
-         model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text" ||
-         model_type.rfind("qwen3_5_", 0) == 0;
 }
 
 bool enable_qwen3_5_spec_verify(const ModelArgs& model_args,

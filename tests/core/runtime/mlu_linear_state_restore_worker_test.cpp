@@ -34,7 +34,8 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-constexpr int64_t kNumSlots = 6;
+constexpr int64_t kNumSlots = 7;
+constexpr int32_t kRestoreSourceSlot = 4;
 
 class LinearStateRestoreWorker final : public WorkerImpl {
  public:
@@ -206,12 +207,12 @@ TEST(MluLinearStateRestoreWorkerTest,
   LinearCacheTensors second =
       make_linear_cache(device, kSecondStride, /*sentinel=*/-202.0f);
   fill_slot(first,
-            /*slot=*/0,
+            kRestoreSourceSlot,
             kFirstStride,
             /*conv_value=*/3.0f,
             /*ssm_value=*/5.0f);
   fill_slot(second,
-            /*slot=*/0,
+            kRestoreSourceSlot,
             kSecondStride,
             /*conv_value=*/7.0f,
             /*ssm_value=*/11.0f);
@@ -245,12 +246,15 @@ TEST(MluLinearStateRestoreWorkerTest,
   LinearStateCacheOp restore;
   restore.linear_state_id = 1;
   restore.restore_requested = true;
-  restore.restore_src_slot_id = 0;
+  restore.restore_src_slot_id = kRestoreSourceSlot;
   LinearStateCacheOp continued;
   continued.linear_state_id = 2;
   LinearStateCacheOp cold;
   cold.linear_state_id = 3;
-  LinearStateCacheOp padding;
+  cold.reset_requested = true;
+  LinearStateCacheOp second_cold;
+  second_cold.linear_state_id = 5;
+  second_cold.reset_requested = true;
 
   ForwardInput input;
   input.token_ids = torch::ones(
@@ -262,7 +266,7 @@ TEST(MluLinearStateRestoreWorkerTest,
   input.input_params.attention.host.q_seq_lens = {0, 1, 2, 3, 4};
   input.input_params.attention.host.kv_cache_tokens_nums = {0, 8, 0, 0};
   input.input_params.linear_state_cache_ops = {
-      restore, continued, cold, padding};
+      restore, continued, cold, second_cold};
 
   ForwardInput processed_input;
   worker.prepare_work_before_execute(input, processed_input);
@@ -276,16 +280,18 @@ TEST(MluLinearStateRestoreWorkerTest,
             std::vector<int64_t>({1, 1, 0, 0}));
   expect_slot_matches(first,
                       /*destination=*/1,
-                      /*source=*/0,
+                      kRestoreSourceSlot,
                       kFirstStride);
   expect_slot_matches(second,
                       /*destination=*/1,
-                      /*source=*/0,
+                      kRestoreSourceSlot,
                       kSecondStride);
   expect_slot_filled(first, /*slot=*/2, kFirstStride, /*value=*/13.0f);
   expect_slot_filled(second, /*slot=*/2, kSecondStride, /*value=*/17.0f);
-  expect_slot_filled(first, /*slot=*/3, kFirstStride, /*value=*/19.0f);
-  expect_slot_filled(second, /*slot=*/3, kSecondStride, /*value=*/23.0f);
+  expect_slot_filled(first, /*slot=*/3, kFirstStride, /*value=*/0.0f);
+  expect_slot_filled(second, /*slot=*/3, kSecondStride, /*value=*/0.0f);
+  expect_slot_filled(first, /*slot=*/5, kFirstStride, /*value=*/0.0f);
+  expect_slot_filled(second, /*slot=*/5, kSecondStride, /*value=*/0.0f);
 }
 
 TEST(MluLinearStateRestoreWorkerTest,
@@ -300,6 +306,13 @@ TEST(MluLinearStateRestoreWorkerTest,
   LinearStateRestoreWorker worker(
       parallel_args, device, runtime_options, model_args);
 
+  constexpr int64_t kSsmStride = 2;
+  LinearCacheTensors cache =
+      make_linear_cache(device, kSsmStride, /*sentinel=*/-101.0f);
+  std::vector<KVCache> kv_caches;
+  kv_caches.emplace_back(LinearAttentionKVCacheTensors{cache.conv, cache.ssm});
+  worker.set_kv_caches(std::move(kv_caches));
+
   ForwardInput input;
   input.token_ids = torch::ones(
       {6}, torch::TensorOptions().dtype(torch::kInt32).device(device));
@@ -309,6 +322,12 @@ TEST(MluLinearStateRestoreWorkerTest,
   input.input_params.attention.host.q_seq_lens = {0, 1, 2, 3, 4, 5, 6};
   input.input_params.attention.host.kv_cache_tokens_nums = {0, 8};
   input.input_params.linear_state_cache_ops.resize(/*count=*/6);
+  for (int32_t row = 0; row < 6; ++row) {
+    LinearStateCacheOp& cache_op =
+        input.input_params.linear_state_cache_ops[static_cast<size_t>(row)];
+    cache_op.linear_state_id = row + 1;
+    cache_op.reset_requested = row < 3;
+  }
 
   ForwardInput processed_input;
   worker.prepare_work_before_execute(input, processed_input);
@@ -377,21 +396,24 @@ TEST(MluLinearStateRestoreWorkerTest,
   LinearStateCacheOp restore;
   restore.linear_state_id = 1;
   restore.restore_requested = true;
-  restore.restore_src_slot_id = 0;
+  restore.restore_src_slot_id = kRestoreSourceSlot;
   LinearStateCacheOp continued;
   continued.linear_state_id = 2;
   LinearStateCacheOp cold;
   cold.linear_state_id = 3;
-  LinearStateCacheOp padding;
+  cold.reset_requested = true;
+  LinearStateCacheOp second_cold;
+  second_cold.linear_state_id = 5;
+  second_cold.reset_requested = true;
 
   ForwardInput input;
   input.input_params.meta.batch_id = 43;
   input.input_params.linear_state_cache_ops = {
-      restore, continued, cold, padding};
+      restore, continued, cold, second_cold};
   input.input_params.linear_state_validity_mask = {0, 1, 0, 0};
 
-  worker.enqueue_previous_chunk_write(
-      /*source_slot=*/0, {{3.0f, 5.0f}, {7.0f, 11.0f}});
+  worker.enqueue_previous_chunk_write(kRestoreSourceSlot,
+                                      {{3.0f, 5.0f}, {7.0f, 11.0f}});
   worker.run_overlap_forward(input, /*destination_slot=*/1);
   worker.synchronize_compute_stream();
 
@@ -411,8 +433,10 @@ TEST(MluLinearStateRestoreWorkerTest,
                                            /*start=*/2 * kSecondStride,
                                            /*length=*/kSecondStride) == 23.0f)
                   .item<bool>());
-  expect_slot_filled(first, /*slot=*/3, kFirstStride, /*value=*/-101.0f);
-  expect_slot_filled(second, /*slot=*/3, kSecondStride, /*value=*/-202.0f);
+  expect_slot_filled(first, /*slot=*/3, kFirstStride, /*value=*/0.0f);
+  expect_slot_filled(second, /*slot=*/3, kSecondStride, /*value=*/0.0f);
+  expect_slot_filled(first, /*slot=*/5, kFirstStride, /*value=*/0.0f);
+  expect_slot_filled(second, /*slot=*/5, kSecondStride, /*value=*/0.0f);
 }
 
 }  // namespace

@@ -164,6 +164,11 @@ bool SpeculativeEngine::allocate_kv_cache() {
          draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
 }
 
+bool SpeculativeEngine::set_speculative_validate_time_predictor(
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+  return engine_->set_speculative_validate_time_predictor(predictor);
+}
+
 // TODO: support dp batches later
 ForwardOutput SpeculativeEngine::step(std::vector<Batch>& batches) {
   return engine_->step(batches);

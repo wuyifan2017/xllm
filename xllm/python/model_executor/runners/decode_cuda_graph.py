@@ -109,17 +109,26 @@ class DecodeCudaGraphRunner(BaseRunner):
         self._warmed_up = False
 
     def can_execute(
-        self, input_ids: torch.Tensor, metadata: AttentionMetadata
+        self,
+        input_ids: torch.Tensor,
+        metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
     ) -> bool:
         graph_key = self._graph_key(input_ids, metadata)
         return (
-            not metadata.is_prefill
+            input_embedding is None
+            and not metadata.is_prefill
             and not metadata.is_chunked_prefill
             and graph_key is not None
             and graph_key in self._graphs
         )
 
-    def warmup(self, device: torch.device, _dtype: torch.dtype) -> None:
+    def warmup(
+        self,
+        device: torch.device,
+        _dtype: torch.dtype,
+        _input_embedding: torch.Tensor | None = None,
+    ) -> None:
         if self._warmed_up:
             return
 
@@ -188,6 +197,7 @@ class DecodeCudaGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = input_ids.shape[0]
         graph_key = self._graph_key(input_ids, metadata)

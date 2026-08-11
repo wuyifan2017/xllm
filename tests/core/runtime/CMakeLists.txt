@@ -3,6 +3,28 @@ include(cc_test)
 if(USE_NPU)
   cc_test(
     NAME
+      mtp_async_input_builder_test
+    SRCS
+      mtp_async_input_builder_test.cpp
+    DEPS
+      :runtime
+      :models
+      GTest::gtest_main
+      torch
+      torch_npu
+      pybind11::embed
+  )
+  target_link_libraries(mtp_async_input_builder_test
+                        PRIVATE
+                        torch_python
+                        Python::Python
+                        ascendcl
+                        hccl
+                        c_sec
+                        nnopbase)
+
+  cc_test(
+    NAME
       acl_graph_executor_test
     SRCS
       acl_graph_executor_test.cpp
@@ -95,6 +117,31 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
+cc_test(
+  NAME
+    adaptive_speculative_controller_test
+  SRCS
+    adaptive_speculative_controller_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/adaptive_speculative_controller.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_profile_registry.cpp"
+  DEPS
+    torch
+    glog::glog
+    proto::xllm_proto
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    speculative_profile_registry_test
+  SRCS
+    speculative_profile_registry_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_profile_registry.cpp"
+  DEPS
+    glog::glog
+    GTest::gtest_main
+)
+
 if(USE_MLU)
   cc_test(
     NAME
@@ -102,6 +149,21 @@ if(USE_MLU)
     SRCS
       mlu_graph_executor_test.cpp
       mlu_linear_state_restore_worker_test.cpp
+    DEPS
+      :runtime
+      :model_loader
+      :batch
+      :kv_cache
+      :platform
+      GTest::gtest_main
+      torch_mlu
+  )
+
+  cc_test(
+    NAME
+      mtp_host_offload_test
+    SRCS
+      mtp_host_offload_test.cpp
     DEPS
       :runtime
       :model_loader

@@ -947,11 +947,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
   prepare_device_on_stream();
 
   if (record_ready_event) {
-    StreamEventPtr event = prepare_stream.record_event();
-    if (event == nullptr) {
-      prepare_stream.synchronize();
-    }
-    processed_input.metadata_ready_event = event;
+    processed_input.metadata_ready_event =
+        prepare_stream.record_event_or_sync();
   } else {
     processed_input.metadata_ready_event.reset();
   }
@@ -1780,6 +1777,13 @@ uint32_t WorkerImpl::transfer_kv_blocks(
         batch_id, block_transfer_info);
   }
   return 0;
+}
+
+void WorkerImpl::set_hierarchy_layer_synchronizer(
+    ModelInputParams& input_params) {
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    hierarchy_kv_cache_transfer_->set_layer_synchronizer(input_params);
+  }
 }
 
 int64_t WorkerImpl::get_active_activation_memory() {
