@@ -173,11 +173,7 @@ KVCacheEstimateOptions make_kv_cache_estimate_options(
 }
 
 void record_metadata_ready_event(Stream& stream, ForwardInput& input) {
-  StreamEventPtr event = stream.record_event();
-  if (event == nullptr) {
-    stream.synchronize();
-  }
-  input.metadata_ready_event = event;
+  input.metadata_ready_event = stream.record_event_or_sync();
 }
 
 void finish_metadata_prepare(Stream& stream, ForwardInput& input) {
@@ -3012,7 +3008,8 @@ void MTPWorkerImpl::prepare_validate_inputs(
   input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
   if (supports_explicit_spec_verify_replay_update()) {
-    build_expanded_spec_verify_graph_input(input_params, device_);
+    build_expanded_spec_verify_graph_input(
+        input_params, device_, options_.block_size());
   }
 #endif
   validate_input.device_tensors_ready = true;
