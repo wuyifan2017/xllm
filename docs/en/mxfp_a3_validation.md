@@ -14,6 +14,10 @@ machine.
   optional native FP4 NZ layout and lossless expanded-FP8 prefill weight cache.
 - Independent build capability detection, E8M0 compatibility and a symbol-free
   implementation for toolchains without MX support.
+- MX Torch adapters, public declarations and build capability detection are
+  owned by xllm-ops (`torch_adapter/` and `cmake/mxfp8.cmake`). xLLM consumes
+  them through the pinned submodule, its existing host library, ACLNN helper
+  and platform guard; model/layer integration remains in xLLM.
 - Model-load and direct-call architecture checks: MXFP4/MXFP8 require Ascend950.
   Ordinary A3 BF16/INT8 paths retain upstream behavior; MX is rejected rather
   than silently converted to BF16.

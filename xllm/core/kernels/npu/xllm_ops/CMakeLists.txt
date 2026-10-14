@@ -1,11 +1,5 @@
 include(cc_library)
 
-if(XLLM_HAS_NPU_MXFP8)
-  set(MXFP8_QUANT_SOURCE mxfp8_quant.cpp)
-else()
-  set(MXFP8_QUANT_SOURCE mxfp8_quant_unavailable.cpp)
-endif()
-
 cc_library(
   NAME
     xllm_ops
@@ -22,7 +16,6 @@ cc_library(
     moe_init_routing_v3.cpp
     quantize.cpp
     quant_dynamic.cpp
-    ${MXFP8_QUANT_SOURCE}
     dequant_swiglu_quant.cpp
     compressor.cpp
     hc_post.cpp
@@ -63,4 +56,9 @@ cc_library(
     opapi
     ${NPU_RUNTIME_SO}
     spdlog::spdlog
+)
+
+add_subdirectory(
+  ${PROJECT_SOURCE_DIR}/third_party/xllm_ops/torch_adapter
+  ${CMAKE_CURRENT_BINARY_DIR}/mx_torch_adapter
 )

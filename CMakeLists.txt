@@ -929,6 +929,6 @@ file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/mooncake_ha_runtime_libraries.txt"
 if(TARGET brpc-static AND NOT TARGET brpc)
   add_library(brpc ALIAS brpc-static)
 endif()
-include(cmake/mxfp8.cmake)
+include(third_party/xllm_ops/cmake/mxfp8.cmake)
 add_subdirectory(xllm)
 add_subdirectory(tests)
