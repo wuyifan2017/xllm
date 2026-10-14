@@ -48,10 +48,14 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
                            const ParallelArgs& parallel_args,
                            const torch::TensorOptions& options);
 
-  torch::Tensor forward(const torch::Tensor& hidden_states,
-                        const AttentionMetadata& attn_metadata,
-                        KVCache& kv_cache,
-                        const ModelInputParams& input_params) override;
+  torch::Tensor forward(
+      const torch::Tensor& hidden_states,
+      const AttentionMetadata& attn_metadata,
+      KVCache& kv_cache,
+      const ModelInputParams& input_params,
+      const torch::Tensor& mx_input_scale = torch::Tensor()) override;
+
+  bool qkv_uses_mxfp8() const override;
 
  protected:
   std::optional<

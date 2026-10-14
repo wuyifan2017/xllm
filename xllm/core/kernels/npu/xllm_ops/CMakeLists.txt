@@ -1,5 +1,11 @@
 include(cc_library)
 
+if(XLLM_HAS_NPU_MXFP8)
+  set(MXFP8_QUANT_SOURCE mxfp8_quant.cpp)
+else()
+  set(MXFP8_QUANT_SOURCE mxfp8_quant_unavailable.cpp)
+endif()
+
 cc_library(
   NAME
     xllm_ops
@@ -16,6 +22,7 @@ cc_library(
     moe_init_routing_v3.cpp
     quantize.cpp
     quant_dynamic.cpp
+    ${MXFP8_QUANT_SOURCE}
     dequant_swiglu_quant.cpp
     compressor.cpp
     hc_post.cpp

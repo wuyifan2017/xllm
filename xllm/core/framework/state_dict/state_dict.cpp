@@ -51,6 +51,12 @@ torch::ScalarType get_dtype(const Dtype& dtype) {
       return torch::kFloat8_e5m2;
     case Dtype::F8_E4M3:
       return torch::kFloat8_e4m3fn;
+    case Dtype::F8_E8M0:
+#if defined(XLLM_HAS_FLOAT8_E8M0)
+      return torch::kFloat8_e8m0fnu;
+#else
+      return torch::kUInt8;
+#endif
     case Dtype::I16:
       return torch::kInt16;
     case Dtype::F16:

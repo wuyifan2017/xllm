@@ -61,8 +61,30 @@ inline bool is_w8a8_quant(
          resolved_weight_quant_method.value() == "w8a8";
 }
 
+// MXFP8 is the block-scaled W8A8 format used by Ascend 950. Quantization
+// descriptions use both the explicit W8A8 name and the shorter MXFP8 alias.
+inline bool is_w4a8_mxfp4_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  if (!resolved_weight_quant_method.has_value()) {
+    return false;
+  }
+  const auto method = to_lower_copy(resolved_weight_quant_method.value());
+  return method == "w4a8_mxfp4" || method == "mxfp4";
+}
+
+inline bool is_w8a8_mxfp8_quant(
+    const std::optional<std::string>& resolved_weight_quant_method) {
+  if (!resolved_weight_quant_method.has_value()) {
+    return false;
+  }
+  const std::string method =
+      to_lower_copy(resolved_weight_quant_method.value());
+  return method == "w8a8_mxfp8" || method == "w8a8_mx_fp8" || method == "mxfp8";
+}
+
 // ── Quantization method identifiers ─────────────────────────────────────────
 static const std::string kQuantMethodFp8 = "fp8";
+static const std::string kQuantMethodW8A8Mxfp8 = "w8a8_mxfp8";
 static const std::string kQuantMethodSmoothquant = "smoothquant";
 static const std::string kQuantMethodAscendInt4 = "ascend_int4";
 static const std::string kQuantMethodAscendInt8 = "ascend_int8";
@@ -170,6 +192,10 @@ class QuantArgs final {
   // Smooth is a per-module checkpoint property, independent of weight bits.
   PROPERTY(bool, preserve_smooth) = false;
   PROPERTY(std::vector<CompressedQuantGroup>, compressed_groups) = {};
+
+  // Block-scaled MXFP8 (8-bit float values with E8M0 scales, normally block
+  // size 32) as emitted by compressed-tensors model exporters.
+  PROPERTY(bool, is_compressed_tensors_w8a8_mxfp8) = false;
 
   // FP8 format : e4m3, e5m2
   PROPERTY(std::string, fmt) = "e4m3";
@@ -285,6 +311,7 @@ class QuantArgs final {
       local_args.quant_method().clear();
       local_args.is_compressed_tensors_w8a8_dynamic() = false;
       local_args.preserve_smooth() = false;
+      local_args.is_compressed_tensors_w8a8_mxfp8() = false;
     }
     return local_args;
   }
@@ -451,6 +478,7 @@ inline std::ostream& operator<<(std::ostream& os, const QuantArgs& args) {
   os << ", activation_dynamic: " << args.activation_dynamic();
   os << ", preserve_smooth: " << args.preserve_smooth();
   os << ", compressed_groups: " << args.compressed_groups().size();
+  os << ", compressed_w8a8_mxfp8: " << args.is_compressed_tensors_w8a8_mxfp8();
   os << ", fmt: " << args.fmt();
   os << ", ignored_modules: " << args.ignored_modules().size();
   os << ", quant_version: " << args.quant_version();

@@ -81,9 +81,15 @@ class Qwen3HybridDecoderLayerImplBase : public Qwen3HybridDecoderLayerModule {
 
   DenseMLP mlp_{nullptr};
   FusedMoE moe_mlp_{nullptr};
+  int32_t layer_id_ = -1;
 
   Qwen3NextRMSNorm input_norm_{nullptr};
   Qwen3NextRMSNorm post_norm_{nullptr};
+  // Lazily-built (post_norm weight + 1) for the Gemma-style fused
+  // Add+RMSNorm+MX-quant path (plain-gamma op, Gemma (1+gamma) norm).
+  torch::Tensor post_norm_gamma_plus_one_;
+  // Same for input_norm -> qkv_proj fused path.
+  torch::Tensor input_norm_gamma_plus_one_;
 };
 
 }  // namespace layer

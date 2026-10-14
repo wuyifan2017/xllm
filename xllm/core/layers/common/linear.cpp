@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "linear.h"
+#include "core/layers/common/linear.h"
 #if defined(USE_MUSA)
 #include "layers/musa/linear_block_fp8.h"
 #endif
@@ -22,17 +22,30 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "core/common/macros.h"
 #include "core/layers/common/quant_utils.h"
+#include "core/platform/mx_quantization.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
 
 namespace xllm {
 namespace layer {
 
 namespace {
+
+bool mx_env_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && std::string(value) == "1";
+}
 
 // ============================================================================
 // FP8 Fused Weight Utilities
@@ -189,6 +202,393 @@ torch::Tensor fp8_linear_forward(
   return xllm::kernel::fp8_scaled_matmul(matmul_params);
 }
 
+#if defined(USE_NPU)
+namespace {
+// Shared QuantBatchMatmulV5 call for the MXFP8 linear paths. The E8M0 bytes
+// are passed as uint8 tensors; the GE dtype codes select the interpretation.
+at::Tensor mxfp8_quant_matmul(const torch::Tensor& quantized_input,
+                              const torch::Tensor& input_scale,
+                              const torch::Tensor& weight,
+                              const torch::Tensor& weight_scale,
+                              const std::optional<torch::Tensor>& bias,
+                              at::ScalarType output_dtype) {
+  check_mx_quantization_supported();
+#if defined(XLLM_HAS_NPU_MX_MATMUL)
+  constexpr int64_t kFloat8E4M3FN = 292;
+  constexpr int64_t kFloat8E5M2 = 291;
+  constexpr int64_t kFloat4E2M1X2 = 296;  // packed fp4 (2 vals/byte)
+  const int64_t weight_dtype =
+      weight.scalar_type() == torch::kFloat8_e5m2 ? kFloat8E5M2 : kFloat8E4M3FN;
+  std::optional<torch::Tensor> bias_fp32;
+  if (bias.has_value() && bias->defined()) {
+    bias_fp32 = bias->scalar_type() == torch::kFloat32
+                    ? bias
+                    : std::optional<torch::Tensor>(bias->to(torch::kFloat32));
+  }
+  return at_npu::native::custom_ops::npu_quant_matmul(
+      quantized_input,
+      weight,
+      weight_scale,
+      std::nullopt,
+      input_scale,
+      bias_fp32,
+      static_cast<int64_t>(output_dtype),
+      /*x1_dtype=*/292,
+      /*x2_dtype=*/weight_dtype,
+      /*pertoken_scale_dtype=*/293,
+      /*scale_dtype=*/293,
+      c10::IntArrayRef({1, 1, 32}),
+      std::nullopt);
+#else
+  LOG(FATAL) << "MXFP8 matmul requires Torch-NPU/CANN MX support.";
+  return {};
+#endif
+}
+}  // namespace
+
+// W4A8 MXFP4 linear: fp4 packed weights + fp8 activations.
+at::Tensor mxfp4_quant_matmul(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale,
+    const torch::Tensor& weight_packed,
+    const torch::Tensor& weight_scale,
+    at::ScalarType output_dtype,
+    int64_t input_dtype = 292,
+    const std::optional<torch::Tensor>& bias = std::nullopt) {
+  check_mx_quantization_supported();
+#if defined(XLLM_HAS_NPU_MX_MATMUL)
+  const int64_t weight_dtype = 296;
+  std::optional<torch::Tensor> bias_bf16;
+  if (bias.has_value() && bias->defined()) {
+    bias_bf16 = bias->reshape({1, -1}).to(torch::kBFloat16);
+  }
+  return at_npu::native::custom_ops::npu_quant_matmul(
+      quantized_input,
+      weight_packed,
+      weight_scale,
+      std::nullopt,
+      input_scale,
+      bias_bf16,
+      static_cast<int64_t>(output_dtype),
+      /*x1_dtype=*/input_dtype,
+      /*x2_dtype=*/weight_dtype,
+      /*pertoken_scale_dtype=*/293,
+      /*scale_dtype=*/293,
+      c10::IntArrayRef({1, 1, 32}),
+      std::nullopt);
+#else
+  LOG(FATAL) << "MXFP4 matmul requires Torch-NPU/CANN MX support.";
+  return {};
+#endif
+}
+
+// MXFP8 W8A8 linear for dense Qwen3.5 projections. Expects load-time
+// prepacked tensors (prepack_mxfp8_linear_weight): weight [K, N] float8 and
+// weight_scale [K/64, N, 2] byte E8M0 values, the layout QuantBatchMatmulV5
+// consumes. Activations are quantized on the fly to [M, K/64, 2].
+torch::Tensor mxfp8_linear_forward(const torch::Tensor& input,
+                                   const torch::Tensor& weight,
+                                   const torch::Tensor& weight_scale,
+                                   const std::optional<torch::Tensor>& bias,
+                                   at::ScalarType output_dtype) {
+  TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn ||
+                  weight.scalar_type() == torch::kFloat8_e5m2,
+              "MXFP8 weight must be FLOAT8_E4M3FN or FLOAT8_E5M2");
+  // Weights arrive prepacked at load time (prepack_mxfp8_linear_weight):
+  // [K, N] float8 values and [K/64, N, 2] uint8 E8M0 scale bytes, exactly
+  // what QuantBatchMatmulV5 consumes, so the hot path issues no copies.
+  TORCH_CHECK(weight.dim() == 2 && weight_scale.dim() == 3,
+              "MXFP8 weight/scale must be prepacked [K, N] + [K/64, N, 2]");
+  const int64_t k = weight.size(0);
+  const int64_t n = weight.size(1);
+  TORCH_CHECK(weight_scale.size(0) == k / 64 && weight_scale.size(1) == n &&
+                  weight_scale.size(2) == 2,
+              "MXFP8 weight/scale shape mismatch");
+  TORCH_CHECK(k % 64 == 0, "MXFP8 linear requires K divisible by 64, got ", k);
+
+  const auto input_shape = input.sizes().vec();
+  auto input_2d = input.view({-1, k});
+  auto quantized = xllm::kernel::npu::mxfp8_dynamic_quant(input_2d);
+  auto output = mxfp8_quant_matmul(std::get<0>(quantized),
+                                   std::get<1>(quantized),
+                                   weight,
+                                   weight_scale,
+                                   bias,
+                                   output_dtype);
+  auto output_shape = input_shape;
+  output_shape.back() = n;
+  return output.view(output_shape);
+}
+
+// GEMM-only variant for callers that fuse the activation quant (for example
+// the SiLU-gate + MX-quant fused MLP path): consumes a pre-quantized
+// (activation, scale) pair produced by mxfp8_dynamic_quant or
+// mxfp8_swiglu_quant.
+torch::Tensor mxfp8_linear_forward_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const std::optional<torch::Tensor>& bias,
+    at::ScalarType output_dtype) {
+  TORCH_CHECK(weight.dim() == 2 && weight_scale.dim() == 3,
+              "MXFP8 weight/scale must be prepacked [K, N] + [K/64, N, 2]");
+  const int64_t k = weight.size(0);
+  const int64_t n = weight.size(1);
+  TORCH_CHECK(quantized_input.dim() == 2 && quantized_input.size(1) == k,
+              "MXFP8 quantized input must be [M, ",
+              k,
+              "]");
+  auto output = mxfp8_quant_matmul(
+      quantized_input, input_scale, weight, weight_scale, bias, output_dtype);
+  auto output_shape = quantized_input.sizes().vec();
+  output_shape.back() = n;
+  return output.view(output_shape);
+}
+#endif
+
+// Preserve logical checkpoint dimensions while arranging packed FP4 NZ storage.
+#if defined(USE_NPU)
+
+namespace {
+void prepack_mxfp4_nz_weight(torch::Tensor& weight) {
+  check_mx_quantization_supported();
+  static const bool enabled = mx_env_enabled("XLLM_MXFP4_W_NZ");
+  if (!enabled ||
+      at_npu::native::get_npu_format(weight) == ACL_FORMAT_FRACTAL_NZ) {
+    return;
+  }
+  const int64_t n = weight.size(0);
+  const int64_t k_half = weight.size(1);
+  if (n % 16 != 0 || k_half % 32 != 0) {
+    return;
+  }
+  // uint8 format_cast uses byte tiles; rearrange packed FP4's half-byte tiles
+  // once so the native NZ kernel reads exactly the checkpoint values.
+  auto packed = weight.to(torch::kCPU)
+                    .reshape({n, k_half / 16, 16})
+                    .permute({1, 0, 2})
+                    .contiguous()
+                    .reshape({k_half / 32, n / 16, 16, 32})
+                    .permute({1, 2, 0, 3})
+                    .contiguous()
+                    .reshape({n, k_half})
+                    .to(weight.device());
+  weight.set_data(
+      at_npu::native::npu_format_cast(packed, ACL_FORMAT_FRACTAL_NZ));
+}
+
+void cache_mxfp4_prefill_fp8(const torch::Tensor& weight,
+                             torch::Tensor& expanded_weight) {
+  check_mx_quantization_supported();
+  if (expanded_weight.defined()) {
+    return;
+  }
+  const int64_t n = weight.size(0);
+  const int64_t k = weight.size(1) * 2;
+  CHECK_EQ(at_npu::native::get_npu_format(weight), ACL_FORMAT_ND)
+      << "Prepare lossless FP8 cache before FP4 NZ conversion";
+  const auto packed = weight.to(torch::kCPU).contiguous();
+  const auto lut = torch::tensor({0.0f,
+                                  0.5f,
+                                  1.0f,
+                                  1.5f,
+                                  2.0f,
+                                  3.0f,
+                                  4.0f,
+                                  6.0f,
+                                  -0.0f,
+                                  -0.5f,
+                                  -1.0f,
+                                  -1.5f,
+                                  -2.0f,
+                                  -3.0f,
+                                  -4.0f,
+                                  -6.0f});
+  auto decoded =
+      torch::empty({n, k}, packed.options().dtype(torch::kFloat8_e4m3fn));
+  constexpr int64_t kRowsPerDecode = 256;
+  for (int64_t start = 0; start < n; start += kRowsPerDecode) {
+    const int64_t count = std::min(kRowsPerDecode, n - start);
+    const auto bytes = packed.narrow(/*dim=*/0, start, count);
+    const auto low = torch::bitwise_and(bytes, 15).to(torch::kLong);
+    const auto high = torch::bitwise_right_shift(bytes, 4).to(torch::kLong);
+    const auto codes = torch::stack({low, high}, /*dim=*/-1).reshape({-1});
+    decoded.narrow(/*dim=*/0, start, count)
+        .copy_(lut.index_select(/*dim=*/0, codes)
+                   .reshape({count, k})
+                   .to(torch::kFloat8_e4m3fn));
+  }
+  expanded_weight = at_npu::native::npu_format_cast(
+      decoded.transpose(0, 1).contiguous().to(weight.device()),
+      ACL_FORMAT_FRACTAL_NZ);
+  LOG_FIRST_N(INFO, 4) << "MXFP4 lossless prefill FP8 cache="
+                       << expanded_weight.sizes();
+}
+}  // namespace
+
+torch::Tensor mxfp4_linear_forward_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale,
+    torch::Tensor& weight_packed,
+    const torch::Tensor& weight_scale,
+    torch::Tensor& expanded_weight,
+    const std::optional<torch::Tensor>& bias,
+    at::ScalarType output_dtype) {
+  TORCH_CHECK(quantized_input.dim() == 2 && input_scale.dim() == 3,
+              "MXFP4 input must be [M, K] with scale [M, K/64, 2]");
+  const int64_t k = quantized_input.size(1);
+  TORCH_CHECK(k % 64 == 0 && input_scale.size(0) == quantized_input.size(0) &&
+                  input_scale.size(1) == k / 64 && input_scale.size(2) == 2,
+              "MXFP4 input/scale shape mismatch");
+  TORCH_CHECK(weight_packed.dim() == 2 && weight_scale.dim() == 2,
+              "MXFP4 checkpoint weight must be [N, K/2], scale [N, K/32]");
+  const int64_t n = weight_packed.size(0);
+  TORCH_CHECK(weight_packed.size(1) == k / 2 && weight_scale.size(0) == n &&
+                  weight_scale.size(1) == k / 32,
+              "MXFP4 checkpoint weight/scale shape mismatch: weight=",
+              weight_packed.sizes(),
+              ", scale=",
+              weight_scale.sizes(),
+              ", input=",
+              quantized_input.sizes());
+  TORCH_CHECK(output_dtype == torch::kBFloat16,
+              "MXFP4 FP8xFP4 pseudo quant matmul requires BF16 output");
+  static const bool prefill_fp8 = mx_env_enabled("XLLM_MXFP4_PREFILL_FP8");
+  static const bool native_control =
+      mx_env_enabled("XLLM_MXFP4_PREFILL_FP8_OFF");
+  if (prefill_fp8) {
+    cache_mxfp4_prefill_fp8(weight_packed, expanded_weight);
+  }
+  prepack_mxfp4_nz_weight(weight_packed);
+  if (prefill_fp8 && !native_control && quantized_input.size(0) >= 1024) {
+    const auto scale =
+        weight_scale.view({n, k / 64, 2}).transpose(0, 1).contiguous();
+    return mxfp8_quant_matmul(quantized_input,
+                              input_scale,
+                              expanded_weight,
+                              scale,
+                              bias,
+                              output_dtype);
+  }
+  // The A8W4 kernel requires transposeX2=true, with matching scale
+  // strides. These views preserve the checkpoint nibble and E8M0 ordering.
+  auto weight_transposed = weight_packed.transpose(0, 1);
+  auto scale_transposed = weight_scale.view({n, k / 64, 2}).transpose(0, 1);
+  auto output = mxfp4_quant_matmul(quantized_input,
+                                   input_scale,
+                                   weight_transposed,
+                                   scale_transposed,
+                                   output_dtype,
+                                   /*input_dtype=*/292,
+                                   bias);
+  return output.view({quantized_input.size(0), n});
+}
+
+torch::Tensor attention_mxfp4_forward_quantized(
+    const torch::Tensor& input,
+    const torch::Tensor& input_scale,
+    torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const std::optional<torch::Tensor>& bias,
+    torch::ScalarType output_dtype) {
+  check_mx_quantization_supported();
+  CHECK_EQ(input.dim(), 2);
+  CHECK_EQ(input.size(1), weight.size(1) * 2);
+  CHECK_EQ(weight_scale.size(0), weight.size(0));
+  CHECK_EQ(weight_scale.size(1) * 32, input.size(1));
+  prepack_mxfp4_nz_weight(weight);
+  const int64_t n = weight.size(0);
+  const int64_t k = input.size(1);
+  return mxfp4_quant_matmul(input,
+                            input_scale,
+                            weight.transpose(0, 1),
+                            weight_scale.view({n, k / 64, 2}).transpose(0, 1),
+                            output_dtype,
+                            /*input_dtype=*/292,
+                            bias)
+      .view({input.size(0), n});
+}
+#endif
+
+// MXFP4 W4A8 linear forward: fp4 packed weights.
+#if defined(USE_NPU)
+torch::Tensor mxfp4_linear_forward(
+    const torch::Tensor& input,
+    torch::Tensor& weight_packed,  // uint8 [N, K/2] or [K/2, N]
+    torch::Tensor& weight_scale,   // uint8 [N, K/32] or [K/64, N, 2]
+    torch::Tensor& decoded_weight,
+    const std::optional<torch::Tensor>& bias,
+    at::ScalarType output_dtype) {
+  if (weight_packed.device() != input.device()) {
+    weight_packed.set_data(weight_packed.to(input.device()));
+  }
+  if (weight_scale.device() != input.device()) {
+    weight_scale.set_data(weight_scale.to(input.device()));
+  }
+  (void)decoded_weight;
+  TORCH_CHECK(weight_packed.dim() == 2 && weight_scale.dim() == 2,
+              "MXFP4 linear requires checkpoint weight and scale layout");
+  const int64_t k_native = weight_packed.size(1) * 2;
+  auto input_2d_native = input.view({-1, k_native});
+  auto quantized_native =
+      xllm::kernel::npu::mxfp8_dynamic_quant(input_2d_native);
+  auto output_native =
+      mxfp4_linear_forward_quantized(std::get<0>(quantized_native),
+                                     std::get<1>(quantized_native),
+                                     weight_packed,
+                                     weight_scale,
+                                     decoded_weight,
+                                     bias,
+                                     output_dtype);
+  auto output_shape_native = input.sizes().vec();
+  output_shape_native.back() = weight_packed.size(0);
+  return output_native.view(output_shape_native);
+}
+
+// One-time load-phase layout prepack for MXFP8 linears. Checkpoint weights
+// are [N, K] with [N, K/32] E8M0 scale bytes; npu_quant_matmul consumes
+// [K, N] weights with [K/64, N, 2] scales. Repacking per forward call (as
+// the original integration did) costs ~19 GB of HBM copy traffic per decode
+// step on Qwen3.8-27B and erases the FP8 weight-size win, so the transform
+// runs once after load instead. Must run after any load-time weight row
+// reorders; idempotent via the scale dimension check (2 -> 3).
+void prepack_mxfp8_linear_weight(torch::Tensor& weight,
+                                 torch::Tensor& weight_scale) {
+  check_mx_quantization_supported();
+  if (!weight.defined() || !weight_scale.defined() || weight_scale.dim() != 2) {
+    return;  // not loaded, or already prepacked (dim == 3)
+  }
+  const int64_t n = weight.size(0);
+  const int64_t k = weight.size(1);
+  CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn ||
+        weight.scalar_type() == torch::kFloat8_e5m2)
+      << "MXFP8 weights must use E4M3FN or E5M2.";
+  CHECK_EQ(k % 64, 0) << "Packed MXFP8 requires K divisible by 64.";
+  CHECK_EQ(weight_scale.size(0), n);
+  CHECK_EQ(weight_scale.size(1), k / 32)
+      << "MXFP8 requires one E8M0 scale per block of 32 weights.";
+  bool e8m0_storage = weight_scale.scalar_type() == torch::kUInt8;
+#if defined(XLLM_HAS_FLOAT8_E8M0)
+  e8m0_storage =
+      e8m0_storage || weight_scale.scalar_type() == torch::kFloat8_e8m0fnu;
+#endif
+  CHECK(e8m0_storage) << "MXFP8 scale must be E8M0 or raw E8M0 bytes.";
+  weight.set_data(weight.transpose(0, 1).contiguous());
+  weight_scale.set_data(
+      weight_scale.view({n, k / 64, 2}).transpose(0, 1).contiguous());
+  // Optional FRACTAL_NZ metadata tag on prepacked [K, N] weights: the cast is
+  // storage-preserving and lets npu_quant_matmul select its NZ code path.
+  // Gated by env so it stays opt-in until validated end to end.
+  static const bool tag_fractal_nz = std::getenv("XLLM_MXFP8_W_NZ") != nullptr;
+  if (tag_fractal_nz) {
+    weight.set_data(
+        at_npu::native::npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ));
+  }
+}
+
+#endif
+
 bool wants_mmrs(RowParallelReduceMode reduce_mode) {
   return reduce_mode == RowParallelReduceMode::MATMUL_REDUCE_SCATTER;
 }
@@ -287,7 +687,8 @@ void ensure_w8a8_params_for_linear_load(
   };
 
   if (!is_w8a8_quant(resolved_weight_quant_method) &&
-      !is_w8a8_dynamic_quant(resolved_weight_quant_method)) {
+      !is_w8a8_dynamic_quant(resolved_weight_quant_method) &&
+      !is_w8a8_mxfp8_quant(resolved_weight_quant_method)) {
     if (!quant_args.quant_descs().empty() ||
         quant_args.is_compressed_tensors_w8a8_dynamic()) {
       // Quant args indicated a checkpoint that may be quantized, so the
@@ -315,7 +716,22 @@ void ensure_w8a8_params_for_linear_load(
   const int64_t in_features = refs.weight.size(1);
 
   specs.reserve(5);
-  if (is_w8a8_quant(resolved_weight_quant_method)) {
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method)) {
+    // MXFP8 stores one E8M0 byte per 32 values along K. Keep the checkpoint
+    // layout here; the matmul wrapper repacks it to [K/64, N, 2].
+    push(refs.weight,
+         refs.weight_is_loaded,
+         "weight",
+         {out_features, in_features},
+         options.dtype(torch::kFloat8_e4m3fn));
+    push(refs.weight_scale,
+         refs.weight_scale_is_loaded,
+         "weight_scale",
+         {out_features, (in_features + 31) / 32},
+         options.dtype(torch::kUInt8));
+    weight::ensure_parameter_storage(module, specs);
+    return;
+  } else if (is_w8a8_quant(resolved_weight_quant_method)) {
     push(refs.input_scale,
          refs.input_scale_is_loaded,
          "input_scale",
@@ -503,7 +919,10 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(const ModelContext& context)
           context.get_model_args().vocab_size(),
           /*bias=*/false,
           /*gather_output=*/true,
-          QuantArgs{},  // do not use quantization for lm_head
+          // Desc-driven lm_head quantization: a checkpoint that marks
+          // lm_head.weight as W8A8_MXFP8 in quant_model_description.json
+          // activates the mxfp8 path; FLOAT/absent entries keep bf16.
+          context.get_quant_args(),
           context.get_parallel_args().lm_head_group_ != nullptr
               ? context.get_parallel_args().lm_head_group_
               : context.get_parallel_args().tp_group_,
@@ -571,6 +990,17 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
                                         weight_,
                                         weight_scale_inv_);
 #endif
+  } else if (quant_args_.quant_method() == kQuantMethodW8A8Mxfp8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, in_features},
+                     options.dtype(torch::kFloat8_e4m3fn)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({out_features_per_partition, (in_features + 31) / 32},
+                     options.dtype(torch::kUInt8)),
+        /*requires_grad=*/false);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
@@ -638,6 +1068,28 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
   } else if (musa::is_block_fp8_quant(quant_args_)) {
     output = musa::block_fp8_or_bf16_forward(
         input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
+#if defined(USE_NPU)
+  } else if ((is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+              quant_args_.quant_method() == "w4a8_mxfp4") &&
+             weight_.scalar_type() == torch::kUInt8) {
+    // W4A8 MXFP4: fp4 packed weights (uint8 [N, K/2]) + fp8 activations.
+    // The packed weight is loaded as-is from the checkpoint's
+    // 'weight_packed' key; no prepack transpose (the op handles [N, K/2]).
+    output = mxfp4_linear_forward(input,
+                                  weight_,
+                                  weight_scale_,
+                                  mxfp4_weight_decoded_,
+                                  bias,
+                                  output_dtype_);
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    // Lazy one-shot [N,K]->[K,N] prepack: load_state_dict runs once per
+    // checkpoint shard, so the transform cannot happen at load time. Runs
+    // during the first (eager prefill) forward, before any ACL graph
+    // capture; idempotent via the scale dimension check.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    output = mxfp8_linear_forward(
+        input, weight_, weight_scale_, bias, output_dtype_);
 #endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     check_fp8_activation_dynamic_supported(quant_args_);
@@ -750,6 +1202,56 @@ std::optional<torch::Tensor> ColumnParallelLinearImpl::bias() const {
 }
 
 // load the weight from the checkpoint
+torch::Tensor ColumnParallelLinearImpl::forward_mx_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale) {
+#if defined(USE_NPU)
+  const bool use_mxfp8 = is_w8a8_mxfp8_quant(resolved_weight_quant_method_);
+  const bool use_mxfp4 = is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+                         quant_args_.quant_method() == "w4a8_mxfp4";
+  TORCH_CHECK(use_mxfp8 || use_mxfp4,
+              "forward_mx_quantized requires MXFP8 or MXFP4 quant method");
+  auto bias =
+      bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  torch::Tensor output;
+  if (use_mxfp8) {
+    // Lazy one-shot prepack; see ColumnParallelLinearImpl::forward.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    output = mxfp8_linear_forward_quantized(quantized_input,
+                                            input_scale,
+                                            weight_,
+                                            weight_scale_,
+                                            bias,
+                                            output_dtype_);
+  } else {
+    output = mxfp4_linear_forward_quantized(quantized_input,
+                                            input_scale,
+                                            weight_,
+                                            weight_scale_,
+                                            mxfp4_weight_decoded_,
+                                            bias,
+                                            output_dtype_);
+  }
+  if (world_size_ > 1 && gather_output_) {
+    output = xllm::parallel_state::gather(output, process_group_);
+  }
+  return output;
+#else
+  (void)quantized_input;
+  (void)input_scale;
+  TORCH_CHECK(false, "forward_mx_quantized is only supported on NPU");
+  return torch::Tensor();
+#endif
+}
+
+bool ColumnParallelLinearImpl::uses_mxfp8_quant() const {
+  return is_w8a8_mxfp8_quant(resolved_weight_quant_method_);
+}
+bool ColumnParallelLinearImpl::uses_mxfp4_quant() const {
+  return is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+         quant_args_.quant_method() == "w4a8_mxfp4";
+}
+
 void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   if (state_dict.size() == 0) {
     return;
@@ -758,6 +1260,29 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   const int64_t world_size = weight_world_size_;
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  // MXFP4: checkpoint stores packed FP4 weights as 'weight_packed'
+  // (uint8 [N, K/2]) + 'weight_scale' (uint8 [N, K/32]). Load these
+  // directly and skip the standard weight path.
+  if (is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+      quant_args_.quant_method() == "w4a8_mxfp4") {
+    check_mx_quantization_supported();
+    CHECK_EQ(world_size_, 1) << "Packed MXFP4 loading currently requires TP1.";
+    try {
+      weight_.set_data(
+          state_dict.get_tensor("weight_packed").to(options_.device()));
+      mxfp4_weight_decoded_ = torch::Tensor();
+      weight_is_loaded_ = true;
+      if (weight_scale_is_loaded_ == false) {
+        weight_scale_ =
+            state_dict.get_tensor("weight_scale").to(options_.device());
+        weight_scale_is_loaded_ = true;
+      }
+      return;  // Skip standard weight loading
+    } catch (...) {
+      // Fall through to standard loading if weight_packed not found
+    }
+  }
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
@@ -803,6 +1328,9 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
     LOAD_SHARDED_WEIGHT(weight, 0);
 #endif
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 0);
+    LOAD_SHARDED_WEIGHT(weight_scale, 0);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 quantization: load FP8 weight and scales
     LOAD_SHARDED_WEIGHT(weight, 0);
@@ -906,6 +1434,46 @@ void ColumnParallelLinearImpl::load_state_dict(
     }
     LOAD_FUSED_WEIGHT(weight, 0);
 #endif
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_FUSED_WEIGHT(weight, 0);
+    LOAD_FUSED_WEIGHT(weight_scale, 0);
+  } else if (is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+             quant_args_.quant_method() == "w4a8_mxfp4") {
+    check_mx_quantization_supported();
+    CHECK_EQ(world_size_, 1) << "Packed MXFP4 loading currently requires TP1.";
+    std::vector<torch::Tensor> packed_parts;
+    std::vector<torch::Tensor> scale_parts;
+    for (const auto& prefix : prefixes) {
+      // MXFP4 packed tensors are already checkpoint-partitioned on TP axes;
+      // unlike ordinary dense weights they are not registered in the
+      // sharded-weight metadata, so get_sharded_tensor() returns undefined.
+      auto packed = state_dict.get_tensor(prefix + "weight_packed");
+      auto scale = state_dict.get_tensor(prefix + "weight_scale");
+      if (packed.defined() && scale.defined()) {
+        packed_parts.push_back(packed);
+        scale_parts.push_back(scale);
+      }
+    }
+    // HF shards split gate/up across files. Each load_state_dict call may
+    // therefore contain only one fused prefix; accumulate rows across calls.
+    if (packed_parts.empty()) {
+      return;
+    }
+    mxfp4_weight_decoded_ = torch::Tensor();
+    auto packed_cat = torch::cat(packed_parts, 0).to(options_.device());
+    auto scale_cat = torch::cat(scale_parts, 0).to(options_.device());
+    if (weight_is_loaded_) {
+      weight_.set_data(torch::cat({weight_, packed_cat}, 0));
+      weight_scale_ = torch::cat({weight_scale_, scale_cat}, 0);
+    } else {
+      weight_.set_data(packed_cat);
+      weight_scale_ = scale_cat;
+    }
+    weight_is_loaded_ = true;
+    weight_scale_is_loaded_ = true;
+    LOG_FIRST_N(INFO, 4) << "Loaded fused MXFP4 packed weight="
+                         << weight_.sizes()
+                         << " scale=" << weight_scale_.sizes();
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     if (is_fp8_channelwise_w8a8(quant_args_)) {
       LOAD_FUSED_WEIGHT(weight, 0);
@@ -1016,6 +1584,7 @@ void ColumnParallelLinearImpl::load_state_dict(
   const int64_t world_size = weight_world_size_;
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
@@ -1063,7 +1632,10 @@ void ColumnParallelLinearImpl::load_state_dict(
     LOAD_MERGED_WEIGHT_V2(weight, 0);
 #endif
   } else {
-    if (is_w8a8_quant(resolved_weight_quant_method_)) {
+    if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+      LOAD_MERGED_WEIGHT_V2(weight, 0);
+      LOAD_MERGED_WEIGHT_V2(weight_scale, 0);
+    } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
       LOAD_MERGED_WEIGHT_V2(weight, 0);
       LOAD_WEIGHT(input_scale);
       LOAD_WEIGHT(input_offset);
@@ -1149,6 +1721,17 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
                                         weight_,
                                         weight_scale_inv_);
 #endif
+  } else if (quant_args_.quant_method() == kQuantMethodW8A8Mxfp8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features_per_partition, hidden_size},
+                     options.dtype(torch::kFloat8_e4m3fn)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({out_features_per_partition, (hidden_size + 31) / 32},
+                     options.dtype(torch::kUInt8)),
+        /*requires_grad=*/false);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
@@ -1195,6 +1778,33 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
   }
 }
 
+torch::Tensor QKVParallelLinearImpl::forward_mx_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale) {
+#if defined(USE_NPU)
+  TORCH_CHECK(is_w8a8_mxfp8_quant(resolved_weight_quant_method_),
+              "forward_mx_quantized requires w8a8_mxfp8 quant method");
+  prepack_mxfp8_linear_weight(weight_, weight_scale_);
+  auto bias =
+      bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+  return mxfp8_linear_forward_quantized(quantized_input,
+                                        input_scale,
+                                        weight_,
+                                        weight_scale_,
+                                        bias,
+                                        output_dtype_);
+#else
+  (void)quantized_input;
+  (void)input_scale;
+  TORCH_CHECK(false, "forward_mx_quantized is only supported on NPU");
+  return torch::Tensor();
+#endif
+}
+
+bool QKVParallelLinearImpl::uses_mxfp8_quant() const {
+  return is_w8a8_mxfp8_quant(resolved_weight_quant_method_);
+}
+
 torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
   input = input.to(device_);
   auto bias =
@@ -1213,6 +1823,13 @@ torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
   } else if (musa::is_block_fp8_quant(quant_args_)) {
     output = musa::block_fp8_or_bf16_forward(
         input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
+#if defined(USE_NPU)
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    // Lazy one-shot prepack; see ColumnParallelLinearImpl::forward.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    output = mxfp8_linear_forward(
+        input, weight_, weight_scale_, bias, output_dtype_);
 #endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     check_fp8_activation_dynamic_supported(quant_args_);
@@ -1325,16 +1942,15 @@ void QKVParallelLinearImpl::load_state_dict(
   if (bias_.defined()) {
     LOAD_QKV_WEIGHT(bias, 0, num_kv_head_replicas_);
   }
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_FUSED_WEIGHT(weight_scale, 0);
 #if defined(USE_MUSA)
-  if (is_block_fp8) {
+  } else if (is_block_fp8) {
     if (!block_fp8_resolved_unquantized_) {
       LOAD_QKV_WEIGHT(weight_scale_inv, 0, num_kv_head_replicas_);
     }
-  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
-#else
-  // FP8: load weight_scale and input_scale, requantize if needed
-  if (quant_args_.quant_method() == kQuantMethodFp8) {
 #endif
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     if (is_fp8_channelwise_w8a8(quant_args_)) {
       LOAD_QKV_WEIGHT(weight_scale, 0, num_kv_head_replicas_);
       return;
@@ -1470,17 +2086,17 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   if (bias_.defined()) {
     LOAD_MERGED_WEIGHT(bias, 0);
   }
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_MERGED_WEIGHT(weight_scale, 0);
 #if defined(USE_MUSA)
-  if (is_block_fp8) {
+  } else if (is_block_fp8) {
     if (!block_fp8_resolved_unquantized_) {
       CHECK_EQ(world_size, 1)
           << "block-fp8 merged QKV scale loading requires TP=1";
       LOAD_WEIGHT(weight_scale_inv);
     }
-  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
-#else
-  if (is_w8a8_quant(resolved_weight_quant_method_)) {
 #endif
+  } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
     const std::vector<std::string> shared_input_prefixes{""};
     load_shared_tensor_from_prefixes_or_fail(state_dict,
                                              shared_input_prefixes,
@@ -1567,6 +2183,17 @@ RowParallelLinearImpl::RowParallelLinearImpl(
                                         weight_,
                                         weight_scale_inv_);
 #endif
+  } else if (quant_args_.quant_method() == kQuantMethodW8A8Mxfp8) {
+    weight_ = register_parameter(
+        "weight",
+        torch::empty({out_features, in_features_per_partition},
+                     options.dtype(torch::kFloat8_e4m3fn)),
+        /*requires_grad=*/false);
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({out_features, (in_features_per_partition + 31) / 32},
+                     options.dtype(torch::kUInt8)),
+        /*requires_grad=*/false);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 W8A8 quantization - weight is stored as FP8 (float8_e4m3fn)
     weight_ = register_parameter(
@@ -1686,6 +2313,29 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
     }
     output = musa::block_fp8_or_bf16_forward(
         input, weight_, weight_scale_inv_, bias, matmul_output_buffer_);
+#endif
+#if defined(USE_NPU)
+  } else if ((is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+              quant_args_.quant_method() == "w4a8_mxfp4") &&
+             weight_.scalar_type() == torch::kUInt8) {
+    if (!input_is_parallelized_ && !skip_scatter) {
+      input = xllm::parallel_state::scatter(input, process_group_);
+    }
+    output = mxfp4_linear_forward(input,
+                                  weight_,
+                                  weight_scale_,
+                                  mxfp4_weight_decoded_,
+                                  bias,
+                                  output_dtype_);
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    log_mmrs_quant_skip(reduce_mode, fc1_ctx, "mxfp8", input);
+    if (!input_is_parallelized_ && !skip_scatter) {
+      input = xllm::parallel_state::scatter(input, process_group_);
+    }
+    // Lazy one-shot prepack; see ColumnParallelLinearImpl::forward.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    output = mxfp8_linear_forward(
+        input, weight_, weight_scale_, bias, output_dtype_);
 #endif
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     log_mmrs_quant_skip(reduce_mode, fc1_ctx, "fp8", input);
@@ -1892,6 +2542,17 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
 #endif
   }
 
+  return apply_row_reduce(output, reduce_mode);
+}
+
+torch::Tensor RowParallelLinearImpl::apply_row_reduce(
+    torch::Tensor output,
+    RowParallelReduceMode reduce_mode) {
+#if defined(USE_NPU)
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+#else
+  const FlashComm1Context* fc1_ctx = nullptr;
+#endif
   if (reduce_mode == RowParallelReduceMode::NONE) {
     return output;
   }
@@ -1910,6 +2571,67 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
   return output;
 }
 
+torch::Tensor RowParallelLinearImpl::forward_mx_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale) {
+  const RowParallelReduceMode reduce_mode =
+      enable_result_reduction_ ? RowParallelReduceMode::ALL_REDUCE
+                               : RowParallelReduceMode::NONE;
+  return forward_mx_quantized(quantized_input, input_scale, reduce_mode);
+}
+
+torch::Tensor RowParallelLinearImpl::forward_mx_quantized(
+    const torch::Tensor& quantized_input,
+    const torch::Tensor& input_scale,
+    RowParallelReduceMode reduce_mode) {
+#if defined(USE_NPU)
+  auto bias = bias_.defined() && rank_ == 0
+                  ? std::optional<torch::Tensor>(bias_)
+                  : std::nullopt;
+  torch::Tensor output;
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    // Lazy one-shot prepack; see ColumnParallelLinearImpl::forward.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    output = mxfp8_linear_forward_quantized(quantized_input,
+                                            input_scale,
+                                            weight_,
+                                            weight_scale_,
+                                            bias,
+                                            output_dtype_);
+  } else if (is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+             quant_args_.quant_method() == "w4a8_mxfp4") {
+    TORCH_CHECK(weight_.scalar_type() == torch::kUInt8,
+                "MXFP4 forward_mx_quantized requires packed uint8 weights");
+    output = mxfp4_linear_forward_quantized(quantized_input,
+                                            input_scale,
+                                            weight_,
+                                            weight_scale_,
+                                            mxfp4_weight_decoded_,
+                                            bias,
+                                            output_dtype_);
+  } else {
+    TORCH_CHECK(false,
+                "forward_mx_quantized requires MXFP8 or MXFP4 quant method");
+  }
+  return apply_row_reduce(output, reduce_mode);
+#else
+  (void)quantized_input;
+  (void)input_scale;
+  (void)reduce_mode;
+  TORCH_CHECK(false, "forward_mx_quantized is only supported on NPU");
+  return torch::Tensor();
+#endif
+}
+
+bool RowParallelLinearImpl::uses_mxfp8_quant() const {
+  return is_w8a8_mxfp8_quant(resolved_weight_quant_method_);
+}
+
+bool RowParallelLinearImpl::uses_mxfp4_quant() const {
+  return is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+         quant_args_.quant_method() == "w4a8_mxfp4";
+}
+
 // load the weight from the checkpoint
 void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   if (state_dict.size() == 0) {
@@ -1917,10 +2639,36 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   }
   // The transposed weight is derived state and must be rebuilt after reload.
   mmrs_weight_t_ = torch::Tensor();
+  mxfp4_qmm_weight_ = torch::Tensor();
+  mxfp4_qmm_scale_ = torch::Tensor();
+  mxfp4_weight_decoded_ = torch::Tensor();
   const int64_t rank = world_size_ == 1 ? 0 : rank_;
   const int64_t world_size = world_size_;
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  // MXFP4 row-parallel projections (for example mlp.down_proj) store packed
+  // FP4 weights under weight_packed rather than the standard weight key.
+  if (is_w4a8_mxfp4_quant(resolved_weight_quant_method_) ||
+      quant_args_.quant_method() == "w4a8_mxfp4") {
+    check_mx_quantization_supported();
+    CHECK_EQ(world_size_, 1) << "Packed MXFP4 loading currently requires TP1.";
+    try {
+      weight_.set_data(
+          state_dict.get_tensor("weight_packed").to(options_.device()));
+      weight_is_loaded_ = true;
+      if (!weight_scale_is_loaded_) {
+        weight_scale_ =
+            state_dict.get_tensor("weight_scale").to(options_.device());
+        weight_scale_is_loaded_ = true;
+      }
+      return;
+    } catch (...) {
+      // Fall through to standard loading if this module is ignored or lacks
+      // packed weights.
+    }
+  }
+
   ensure_w8a8_params_for_linear_load(
       this,
       quant_args_,
@@ -1964,6 +2712,9 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
     LOAD_SHARDED_WEIGHT(weight, 1);
 #endif
+  } else if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_SHARDED_WEIGHT(weight, 1);
+    LOAD_SHARDED_WEIGHT(weight_scale, 1);
   } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // FP8 quantization: load FP8 weight and scales
     LOAD_SHARDED_WEIGHT(weight, 1);
@@ -2016,7 +2767,18 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
 #if defined(USE_MUSA)
   musa::check_quantization_supported(quant_args_);
 #endif
-  if (quant_args_.quant_method() == kQuantMethodFp8) {
+  if (quant_args_.quant_method() == kQuantMethodW8A8Mxfp8) {
+    weight_ =
+        register_parameter("weight",
+                           torch::empty({out_features, in_features},
+                                        options.dtype(torch::kFloat8_e4m3fn)),
+                           /*requires_grad=*/false);
+    weight_scale_ =
+        register_parameter("weight_scale",
+                           torch::empty({out_features, (in_features + 31) / 32},
+                                        options.dtype(torch::kUInt8)),
+                           /*requires_grad=*/false);
+  } else if (quant_args_.quant_method() == kQuantMethodFp8) {
     // Replicated projections are mixed in DeepSeek checkpoints: attention
     // low-rank projections can be FP8, while router gates remain BF16. Keep the
     // storage in runtime dtype initially and switch to FP8 lazily after seeing
@@ -2051,6 +2813,16 @@ ReplicatedLinearImpl::ReplicatedLinearImpl(
 torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+#if defined(USE_NPU)
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+        << "weight_scale is required for MXFP8 replicated linear.";
+    // Lazy one-shot prepack; see ColumnParallelLinearImpl::forward.
+    prepack_mxfp8_linear_weight(weight_, weight_scale_);
+    return mxfp8_linear_forward(
+        input, weight_, weight_scale_, bias, output_dtype_);
+  }
+#endif
   if (is_fp8_dtype(weight_.scalar_type())) {
     check_fp8_activation_dynamic_supported(quant_args_);
     CHECK(weight_scale_.defined())
@@ -2198,7 +2970,9 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
 #endif
 
   LOAD_WEIGHT(weight);
-  if (is_fp8_dtype(weight_.scalar_type())) {
+  if (is_w8a8_mxfp8_quant(resolved_weight_quant_method_)) {
+    LOAD_WEIGHT(weight_scale);
+  } else if (is_fp8_dtype(weight_.scalar_type())) {
     LOAD_WEIGHT(weight_scale);
     if (!quant_args_.activation_dynamic() && input_scale_.defined()) {
       LOAD_WEIGHT(input_scale);

@@ -1296,4 +1296,80 @@ TEST(HFModelLoaderTest, RejectMixedPrecisionMalformedRegex) {
   }
 }
 
+TEST(HFModelLoaderTest, MxMethodsRequireExactAliases) {
+  for (const std::string& method : {"W8A8_MXFP8", "w8a8_mx_fp8", "mxfp8"}) {
+    EXPECT_TRUE(is_w8a8_mxfp8_quant(method));
+  }
+  for (const std::string& method : {"W4A8_MXFP4", "mxfp4"}) {
+    EXPECT_TRUE(is_w4a8_mxfp4_quant(method));
+  }
+  for (const std::string& method :
+       {"mxfp8_unknown", "w8a8_mxfp8_int8", "fp8", "w8a8_dynamic"}) {
+    EXPECT_FALSE(is_w8a8_mxfp8_quant(method));
+  }
+  EXPECT_FALSE(is_w4a8_mxfp4_quant("mxfp4_unknown"));
+}
+
+TEST(HFModelLoaderTest, Mxfp8RequiresSymmetricBlock32E8m0) {
+  const auto config = nlohmann::json::parse(R"json({
+    "quantization_config": {
+      "quant_method": "compressed-tensors", "format": "float-quantized",
+      "config_groups": {"group_0": {
+        "targets": ["Linear"],
+        "weights": {"type": "float", "num_bits": 8, "dynamic": false,
+          "strategy": "group", "symmetric": true,
+          "block_structure": [1,32], "scale_dtype": "e8m0"},
+        "input_activations": {"type": "float", "num_bits": 8, "dynamic": true,
+          "strategy": "group", "symmetric": true,
+          "block_structure": [1,32], "scale_dtype": "float8_e8m0"}
+      }}
+    }
+  })json");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(config.dump()));
+  QuantArgs args;
+  ASSERT_TRUE(load_quant_cfg(reader, args));
+  EXPECT_TRUE(args.is_compressed_tensors_w8a8_mxfp8());
+  for (const std::string& target : {"weights", "input_activations"}) {
+    for (const auto& patch :
+         std::vector<nlohmann::json>{{{"block_structure", {1, 64}}},
+                                     {{"scale_dtype", "float32"}},
+                                     {{"symmetric", false}},
+                                     {{"num_bits", "8"}},
+                                     {{"type", nullptr}}}) {
+      auto invalid = config;
+      invalid["quantization_config"]["config_groups"]["group_0"][target]
+          .merge_patch(patch);
+      ASSERT_TRUE(reader.parse_text(invalid.dump()));
+      QuantArgs invalid_args;
+      EXPECT_FALSE(load_quant_cfg(reader, invalid_args));
+    }
+  }
+}
+
+TEST(HFModelLoaderTest, Mxfp4PackedSchemeAndIgnore) {
+  auto config = nlohmann::json::parse(R"json({
+    "quantization_config": {
+      "quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+      "ignore": ["lm_head"], "config_groups": {"group_0": {
+        "targets": ["Linear"], "input_activations": null,
+        "weights": {"type": "float", "num_bits": 4, "dynamic": false,
+          "strategy": "group", "group_size": 32, "symmetric": true}
+      }}
+    }
+  })json");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(config.dump()));
+  QuantArgs args;
+  ASSERT_TRUE(load_quant_cfg(reader, args));
+  EXPECT_EQ(args.quant_method(), "w4a8_mxfp4");
+  EXPECT_EQ(args.bits(), 4);
+  EXPECT_TRUE(args.for_module("lm_head").quant_method().empty());
+  config["quantization_config"]["config_groups"]["group_0"]["weights"]
+        ["group_size"] = 64;
+  ASSERT_TRUE(reader.parse_text(config.dump()));
+  QuantArgs invalid_args;
+  EXPECT_FALSE(load_quant_cfg(reader, invalid_args));
+}
+
 }  // namespace xllm

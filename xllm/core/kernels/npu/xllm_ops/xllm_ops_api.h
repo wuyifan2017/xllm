@@ -179,6 +179,41 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> dynamic_quant(
     const c10::optional<at::Tensor>& group_index,
     c10::optional<at::ScalarType> dst_type);
 
+bool mxfp8_runtime_available();
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_dynamic_quant(const at::Tensor& input);
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_swiglu_quant(
+    const at::Tensor& gate_up_out,
+    bool activate_left,
+    double clamp_limit);
+
+std::tuple<at::Tensor, at::Tensor> mxfp4_swiglu_quant(
+    const at::Tensor& gate_up_out,
+    bool activate_left,
+    double clamp_limit);
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_rms_norm_quant(const at::Tensor& x,
+                                                        const at::Tensor& gamma,
+                                                        double epsilon);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mxfp8_add_rms_norm_quant(
+    const at::Tensor& x1,
+    const at::Tensor& x2,
+    const at::Tensor& gamma,
+    double epsilon);
+
+int64_t verify_mxfp8_swiglu_quant(const at::Tensor& x,
+                                  const at::Tensor& ref_act,
+                                  double clamp_limit);
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_grouped_matmul_swiglu_quant(
+    const at::Tensor& x,
+    const torch::TensorList& weight,
+    const torch::TensorList& weight_scale,
+    const at::Tensor& x_scale,
+    const at::Tensor& group_list);
+
 std::tuple<at::Tensor, at::Tensor> dequant_swiglu_quant(
     const at::Tensor& x,
     const c10::optional<at::Tensor>& weight_scale,
@@ -541,6 +576,33 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     const std::optional<torch::Tensor>& cu_seqlens = std::nullopt,
     c10::ArrayRef<int32_t> q_seq_lens = {},
     bool use_qk_l2norm_in_kernel = false);
+
+torch::Tensor npu_mega_gdn_decode(const torch::Tensor& qkv,
+                                  const torch::Tensor& z,
+                                  const torch::Tensor& b,
+                                  const torch::Tensor& a,
+                                  const torch::Tensor& conv_weight,
+                                  torch::Tensor& conv_state,
+                                  const torch::Tensor& a_log,
+                                  const torch::Tensor& dt_bias,
+                                  torch::Tensor& ssm_state,
+                                  const torch::Tensor& read_state_indices,
+                                  const torch::Tensor& write_state_indices,
+                                  const torch::Tensor& norm_weight);
+
+torch::Tensor npu_mega_gdn_mtp_decode(const torch::Tensor& qkv,
+                                      const torch::Tensor& z,
+                                      const torch::Tensor& b,
+                                      const torch::Tensor& a,
+                                      const torch::Tensor& conv_weight,
+                                      torch::Tensor& conv_state,
+                                      const torch::Tensor& a_log,
+                                      const torch::Tensor& dt_bias,
+                                      torch::Tensor& ssm_state,
+                                      const torch::Tensor& read_state_indices,
+                                      const torch::Tensor& write_state_indices,
+                                      const torch::Tensor& num_accepted_tokens,
+                                      const torch::Tensor& norm_weight);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> npu_mega_gdn_prefill(
     const torch::Tensor& mixed_qkv,
