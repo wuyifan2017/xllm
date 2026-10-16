@@ -21,6 +21,10 @@ limitations under the License.
 
 #include "common/flash_comm1_context.h"
 
+#if defined(USE_NPU)
+#include "kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
+
 namespace xllm {
 namespace layer {
 
@@ -28,6 +32,7 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
     const ModelContext& context,
     int32_t layer_id,
     std::shared_ptr<Qwen3GatedDeltaNetBaseImpl> linear_attention_module) {
+  layer_id_ = layer_id;
   const auto& model_args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
@@ -84,6 +89,8 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
 
 void Qwen3HybridDecoderLayerImplBase::load_state_dict(
     const StateDict& state_dict) {
+  input_norm_gamma_plus_one_ = torch::Tensor();
+  post_norm_gamma_plus_one_ = torch::Tensor();
   if (attention_) {
     attention_->load_state_dict(state_dict.get_dict_with_prefix("self_attn."));
   } else {
@@ -117,10 +124,42 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     const ModelInputParams& input_params,
     const torch::Tensor& mrope_cos_sin) {
   const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+#if defined(USE_NPU)
+  // GDN layers whose input projections (in_proj_qkv/z/b/a) are all mxfp8:
+  // fuse (Add+)RMSNorm+MX-quant once and let every projection consume the
+  // shared (e4m3, scale) pair (ceil scale policy, matching the
+  // post_norm->gate_up fusion below). Full-attention layers keep the
+  // separate norm.
+  const bool fuse_gdn_input_norm_mx =
+#if defined(XLLM_HAS_NPU_MXFP8)
+      linear_attention_ && linear_attention_->qkv_uses_mxfp8() &&
+      !(fc1_ctx && is_sequence_sharded(*fc1_ctx));
+#else
+      false;
+#endif
+#endif
+  // Defined when the input-norm + MX-quant fusion produced a pre-quantized
+  // hidden state for the GDN projections.
+  torch::Tensor mx_qkv_scale;
   // Pre-attention norm
   if (!residual.has_value()) {
     residual = x;
-    x = std::get<0>(input_norm_->forward(x));
+#if defined(USE_NPU)
+    if (fuse_gdn_input_norm_mx) {
+      if (!input_norm_gamma_plus_one_.defined()) {
+        input_norm_gamma_plus_one_ =
+            (input_norm_->weight().to(torch::kFloat) + 1.0)
+                .to(input_norm_->weight().dtype());
+      }
+      auto fused = xllm::kernel::npu::mxfp8_rms_norm_quant(
+          x, input_norm_gamma_plus_one_, input_norm_->eps());
+      x = std::get<0>(fused);
+      mx_qkv_scale = std::get<1>(fused);
+    } else
+#endif
+    {
+      x = std::get<0>(input_norm_->forward(x));
+    }
   } else {
     if (fc1_ctx && is_sequence_sharded(*fc1_ctx) &&
         residual.value().size(0) != x.size(0)) {
@@ -131,7 +170,23 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
           << "FC1 input residual and hidden states must share the same "
           << "padded local sequence layout.";
     }
-    std::tie(x, residual) = input_norm_->forward(x, residual);
+#if defined(USE_NPU)
+    if (fuse_gdn_input_norm_mx) {
+      if (!input_norm_gamma_plus_one_.defined()) {
+        input_norm_gamma_plus_one_ =
+            (input_norm_->weight().to(torch::kFloat) + 1.0)
+                .to(input_norm_->weight().dtype());
+      }
+      auto fused = xllm::kernel::npu::mxfp8_add_rms_norm_quant(
+          x, residual.value(), input_norm_gamma_plus_one_, input_norm_->eps());
+      residual = std::get<2>(fused);
+      x = std::get<0>(fused);
+      mx_qkv_scale = std::get<1>(fused);
+    } else
+#endif
+    {
+      std::tie(x, residual) = input_norm_->forward(x, residual);
+    }
   }
 
   // Attention
@@ -139,7 +194,8 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     x = attention_->forward(
         positions, x, attn_metadata, kv_cache, mrope_cos_sin);
   } else {
-    x = linear_attention_->forward(x, attn_metadata, kv_cache, input_params);
+    x = linear_attention_->forward(
+        x, attn_metadata, kv_cache, input_params, mx_qkv_scale);
   }
 
   // Post-attention norm
@@ -151,6 +207,26 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
         << "FC1 post-attention residual and hidden states must share the same "
         << "padded local sequence layout.";
   }
+
+#if defined(USE_NPU)
+  // Fused Add+RMSNorm+MX-quant -> gate_up path (ceil scale policy; the
+  // per-linear npu_dynamic_mx_quant rounds scales to nearest and clips
+  // block maxima). Qwen3NextRMSNorm is Gemma-style ((1+gamma)), while the
+  // fused op takes plain gamma, so pass weight + 1. Skipped for MoE layers.
+  if (!moe_mlp_ && mlp_ && residual.has_value() &&
+      !(fc1_ctx && is_sequence_sharded(*fc1_ctx)) &&
+      mlp_->gate_up_uses_mxfp8()) {
+    if (!post_norm_gamma_plus_one_.defined()) {
+      post_norm_gamma_plus_one_ = (post_norm_->weight().to(torch::kFloat) + 1.0)
+                                      .to(post_norm_->weight().dtype());
+    }
+    auto fused = xllm::kernel::npu::mxfp8_add_rms_norm_quant(
+        x, residual.value(), post_norm_gamma_plus_one_, post_norm_->eps());
+    residual = std::get<2>(fused);
+    x = mlp_->forward_mx_quantized(std::get<0>(fused), std::get<1>(fused));
+    return x;
+  }
+#endif
 
   std::tie(x, residual) = post_norm_->forward(x, residual);
 

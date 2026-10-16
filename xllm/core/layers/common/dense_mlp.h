@@ -47,6 +47,13 @@ class DenseMLPImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states);
 
+  // MXFP8 path consuming a pre-quantized (activation, scale) pair for
+  // gate_up_proj (from the fused Add+RMSNorm+MX-quant at post_norm).
+  torch::Tensor forward_mx_quantized(const torch::Tensor& quantized_input,
+                                     const torch::Tensor& input_scale);
+
+  bool gate_up_uses_mxfp8() const;
+
   void load_state_dict(const StateDict& state_dict);
   void load_state_dict(const StateDict& state_dict,
                        const std::vector<std::string>& gate_up_name,
@@ -58,6 +65,13 @@ class DenseMLPImpl : public torch::nn::Module {
   std::optional<torch::Tensor> get_fp8_input_scale() const;
 
  private:
+  torch::Tensor forward_from_gate_up(torch::Tensor gate_up);
+
+  // One-shot (process-wide) decision for the fused SiLU-gate + MX-quant
+  // down_proj path. Runs at load time on device tensors, before any forward
+  // (and therefore before ACL graph capture).
+  void maybe_decide_mxfp8_swiglu_fusion();
+
   bool is_gated_;
   int64_t intermediate_size_;
   ProcessGroup* process_group_;

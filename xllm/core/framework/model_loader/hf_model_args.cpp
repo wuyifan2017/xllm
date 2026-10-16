@@ -62,6 +62,43 @@ bool is_compressed_tensors_fp8_scheme(const nlohmann::json& config) {
          supported_compressed_bits(*num_bits_it) == kCompressedBits8;
 }
 
+bool is_compressed_tensors_mxfp8_scheme(const nlohmann::json& config) {
+  if (!config.is_object() || !config.contains("type") ||
+      !config.at("type").is_string() || config.at("type") != "float" ||
+      !config.contains("num_bits") ||
+      !config.at("num_bits").is_number_integer() ||
+      config.at("num_bits") != 8) {
+    return false;
+  }
+  const auto strategy_it = config.find("strategy");
+  const auto block_structure_it = config.find("block_structure");
+  const auto scale_dtype_it = config.find("scale_dtype");
+  const bool grouped = strategy_it != config.end() &&
+                       strategy_it->is_string() &&
+                       boost::iequals(strategy_it->get<std::string>(), "group");
+  const bool block_scaled =
+      block_structure_it != config.end() && block_structure_it->is_array();
+  const bool e8m0_scale =
+      scale_dtype_it != config.end() && scale_dtype_it->is_string() &&
+      (boost::iequals(scale_dtype_it->get<std::string>(), "float8_e8m0") ||
+       boost::iequals(scale_dtype_it->get<std::string>(), "e8m0"));
+  const bool block32 = block_scaled && block_structure_it->size() == 2 &&
+                       (*block_structure_it)[0].is_number_integer() &&
+                       (*block_structure_it)[1].is_number_integer() &&
+                       *block_structure_it == nlohmann::json::array({1, 32});
+  return grouped && block32 && e8m0_scale &&
+         config.value("symmetric", nlohmann::json()) == true;
+}
+
+bool has_mx_scale_scheme(const nlohmann::json& scheme) {
+  if (!scheme.is_object()) {
+    return false;
+  }
+  return scheme.value("strategy", nlohmann::json()) == "group" ||
+         scheme.value("scale_dtype", nlohmann::json()) == "e8m0" ||
+         scheme.value("scale_dtype", nlohmann::json()) == "float8_e8m0";
+}
+
 const nlohmann::json* get_compressed_tensors_config(
     const JsonReader& reader,
     const std::string& config_key) {
@@ -203,7 +240,84 @@ bool load_ct_quant_config(const nlohmann::json& config, QuantArgs& quant_args) {
     auto weights_it = group.find("weights");
     auto input_activations_it = group.find("input_activations");
     if (weights_it == group.end() || input_activations_it == group.end() ||
-        !weights_it->is_object() || !input_activations_it->is_object()) {
+        !weights_it->is_object() ||
+        (!input_activations_it->is_object() &&
+         !input_activations_it->is_null())) {
+      continue;
+    }
+
+    const auto format =
+        group.value("format", config.value("format", nlohmann::json()));
+    if (format == "mxfp4-pack-quantized") {
+      if (config_groups_it->size() != 1 ||
+          weights_it->value("type", nlohmann::json()) != "float" ||
+          weights_it->value("num_bits", nlohmann::json()) != 4 ||
+          weights_it->value("strategy", nlohmann::json()) != "group" ||
+          weights_it->value("group_size", nlohmann::json()) != 32 ||
+          weights_it->value("symmetric", nlohmann::json(true)) != true ||
+          weights_it->value("dynamic", nlohmann::json(false)) != false ||
+          !input_activations_it->is_null() ||
+          group.value("targets", nlohmann::json::array({"Linear"})) !=
+              nlohmann::json::array({"Linear"}) ||
+          (group.contains("output_activations") &&
+           !group.at("output_activations").is_null()) ||
+          (config.contains("kv_cache_scheme") &&
+           !config.at("kv_cache_scheme").is_null()) ||
+          (config.contains("transform_config") &&
+           !config.at("transform_config").is_null() &&
+           !config.at("transform_config").empty())) {
+        LOG(ERROR) << "MXFP4 requires one static symmetric block-32 FP4 Linear "
+                      "weight group.";
+        return false;
+      }
+      quant_args.quant_method() = "w4a8_mxfp4";
+      quant_args.bits() = 4;
+      quant_args.moe_weight_bits() = 4;
+      quant_args.activation_dynamic() = true;
+      return true;
+    }
+
+    const bool weights_mxfp8 = is_compressed_tensors_mxfp8_scheme(*weights_it);
+    const bool activations_mxfp8 =
+        is_compressed_tensors_mxfp8_scheme(*input_activations_it);
+    if (weights_mxfp8 && activations_mxfp8) {
+      if (format != "float-quantized" || config_groups_it->size() != 1 ||
+          weights_it->value("dynamic", nlohmann::json(false)) != false ||
+          input_activations_it->value("dynamic", nlohmann::json(false)) !=
+              true ||
+          weights_it->value("preserve_smooth", nlohmann::json(false)) !=
+              false ||
+          input_activations_it->value("preserve_smooth",
+                                      nlohmann::json(false)) != false ||
+          group.value("targets", nlohmann::json()) !=
+              nlohmann::json::array({"Linear"}) ||
+          (group.contains("output_activations") &&
+           !group.at("output_activations").is_null()) ||
+          (config.contains("kv_cache_scheme") &&
+           !config.at("kv_cache_scheme").is_null()) ||
+          (config.contains("transform_config") &&
+           !config.at("transform_config").is_null() &&
+           !config.at("transform_config").empty())) {
+        LOG(ERROR) << "MXFP8 requires one symmetric block-32 E8M0 Linear group "
+                      "with dynamic activations.";
+        return false;
+      }
+      quant_args.quant_method() = kQuantMethodW8A8Mxfp8;
+      quant_args.bits() = 8;
+      quant_args.moe_weight_bits() = 8;
+      quant_args.is_compressed_tensors_w8a8_mxfp8() = true;
+      quant_args.activation_dynamic() = true;
+      quant_args.weight_block_size() = {1, 32};
+      return true;
+    }
+    if ((weights_it->value("type", nlohmann::json()) == "float" ||
+         input_activations_it->is_null()) &&
+        (has_mx_scale_scheme(*weights_it) ||
+         has_mx_scale_scheme(*input_activations_it))) {
+      LOG(ERROR) << "Unsupported MX quantization scheme.";
+      return false;
+    }
+    if (!input_activations_it->is_object()) {
       continue;
     }
 

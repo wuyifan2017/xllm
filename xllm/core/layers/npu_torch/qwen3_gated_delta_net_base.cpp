@@ -535,7 +535,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    const torch::Tensor& mx_input_scale) {
+  mx_input_scale_ = mx_input_scale;
   // Early-return on dummy shards. Under dp>1, an empty shard is padded with a
   // fake token by worker_impl but its GDN state tensors (kv_cache_tokens_nums,
   // linear_state_ids etc.) are left undefined. This mirrors the is_dummy

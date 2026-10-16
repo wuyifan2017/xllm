@@ -47,6 +47,10 @@ limitations under the License.
 #include "core/framework/tokenizer/tiktoken_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_factory.h"
 #include "core/platform/device.h"
+#include "core/platform/platform.h"
+#if defined(USE_NPU) && defined(XLLM_HAS_NPU_MXFP8)
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
 #include "core/util/blocking_counter.h"
 #include "core/util/json_reader.h"
 #include "core/util/model_config_utils.h"
@@ -59,6 +63,14 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+bool is_unknown_mx_method(const std::string& method) {
+  const std::string normalized = to_lower_copy(method);
+  const bool mentions_mx = normalized.find("mxfp") != std::string::npos ||
+                           normalized.find("mx_fp") != std::string::npos;
+  return mentions_mx && !is_w4a8_mxfp4_quant(method) &&
+         !is_w8a8_mxfp8_quant(method);
+}
 
 bool try_parse_layer_id_with_prefix(const std::string& tensor_name,
                                     const std::string& prefix,
@@ -571,6 +583,14 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
   if (reader.contains("torch_dtype")) {
     quant_args_.torch_dtype() = reader.value_or<std::string>("torch_dtype", "");
   }
+  if (is_w8a8_mxfp8_quant(quant_args_.quant_method()) ||
+      is_w8a8_mxfp8_quant(quant_args_.quantize_type())) {
+    quant_args_.quant_method() = kQuantMethodW8A8Mxfp8;
+    quant_args_.quantize_type() = kQuantMethodW8A8Mxfp8;
+    quant_args_.bits() = 8;
+    quant_args_.moe_weight_bits() = 8;
+    quant_args_.is_compressed_tensors_w8a8_mxfp8() = true;
+  }
   if (auto v = reader.value<std::string>("quantization_config.version")) {
     quant_args_.quant_version() = v.value();
   }
@@ -603,6 +623,7 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
     bool desc_has_w8a8 = false;
     bool desc_has_w4a8_dynamic = false;
     bool desc_has_w8a8_dynamic = false;
+    bool desc_has_mxfp8 = false;
     if (!quant_desc_data.is_object()) {
       LOG(WARNING) << "quant_model_description is not a JSON object: "
                    << quant_desc_file_path;
@@ -619,6 +640,7 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
           continue;
         }
         const std::string quant_type = it.value().get<std::string>();
+        desc_has_mxfp8 = desc_has_mxfp8 || is_w8a8_mxfp8_quant(quant_type);
         std::string quant_type_lower = quant_type;
         boost::algorithm::to_lower(quant_type_lower);
         if (boost::algorithm::starts_with(quant_type_lower, "w4a8")) {
@@ -642,7 +664,13 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
       }
     }
     quant_args_.quant_descs() = std::move(quant_descs);
-    if (desc_has_w4a8) {
+    if (desc_has_mxfp8) {
+      quant_args_.quant_method() = kQuantMethodW8A8Mxfp8;
+      quant_args_.quantize_type() = kQuantMethodW8A8Mxfp8;
+      quant_args_.bits() = 8;
+      quant_args_.moe_weight_bits() = 8;
+      quant_args_.is_compressed_tensors_w8a8_mxfp8() = true;
+    } else if (desc_has_w4a8) {
       quant_args_.quant_method() = kQuantMethodAscendInt4;
     } else if (desc_has_w8a8) {
       quant_args_.quant_method() = kQuantMethodAscendInt8;
@@ -657,7 +685,8 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
     const std::string desc_inferred_quantize_type =
         infer_quantize_type_from_desc(desc_has_w4a8_dynamic,
                                       desc_has_w8a8_dynamic);
-    if (!has_config_quantize && !desc_inferred_quantize_type.empty()) {
+    if (!desc_has_mxfp8 && !has_config_quantize &&
+        !desc_inferred_quantize_type.empty()) {
       quant_args_.quantize_type() = desc_inferred_quantize_type;
     }
     if (quant_args_.quantize_type().empty()) {
@@ -748,6 +777,45 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
     }
   }
 
+  bool has_mxfp4 = is_w4a8_mxfp4_quant(quant_args_.quant_method()) ||
+                   is_w4a8_mxfp4_quant(quant_args_.quantize_type());
+  bool has_mxfp8 = is_w8a8_mxfp8_quant(quant_args_.quant_method()) ||
+                   is_w8a8_mxfp8_quant(quant_args_.quantize_type());
+  if (is_unknown_mx_method(quant_args_.quant_method()) ||
+      is_unknown_mx_method(quant_args_.quantize_type())) {
+    LOG(ERROR) << "Unsupported MX quantization method.";
+    return false;
+  }
+  for (const auto& [name, method] : quant_args_.quant_descs()) {
+    if (is_unknown_mx_method(method)) {
+      LOG(ERROR) << "Unsupported MX quantization method for " << name;
+      return false;
+    }
+    has_mxfp4 = has_mxfp4 || is_w4a8_mxfp4_quant(method);
+    has_mxfp8 = has_mxfp8 || is_w8a8_mxfp8_quant(method);
+  }
+  if ((has_mxfp4 || has_mxfp8) && !Platform::is_ascend950()) {
+    LOG(ERROR) << "MXFP4/MXFP8 requires Ascend950 (A5); A2/A3 are unsupported.";
+    return false;
+  }
+  if (has_mxfp8) {
+#if defined(USE_NPU) && defined(XLLM_HAS_NPU_MXFP8)
+    if (!kernel::npu::mxfp8_runtime_available()) {
+      LOG(ERROR) << "Required MXFP8 CANN runtime APIs are unavailable.";
+      return false;
+    }
+#else
+    LOG(ERROR) << "MXFP8 requires compatible Torch-NPU/CANN build headers.";
+    return false;
+#endif
+  }
+  if (has_mxfp4) {
+#if !defined(USE_NPU) || !defined(XLLM_HAS_NPU_MX_DYNAMIC_QUANT) || \
+    !defined(XLLM_HAS_NPU_MX_MATMUL)
+    LOG(ERROR) << "MXFP4 requires compatible Torch-NPU/CANN MX build headers.";
+    return false;
+#endif
+  }
   return true;
 }
 

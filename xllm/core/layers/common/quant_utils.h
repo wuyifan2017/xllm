@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/quantization/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
+#include "core/platform/mx_quantization.h"
 #include "kernels/ops_api.h"
 
 namespace xllm {
@@ -57,7 +58,37 @@ inline void resolve_weight_quant_method_for_linear_load(
     const auto resolved = quant_args.get_quant_method_from_prefixes(
         state_dict.prefix(), prefixes);
     if (resolved.has_value()) {
+      if (is_w4a8_mxfp4_quant(resolved) || is_w8a8_mxfp8_quant(resolved)) {
+        check_mx_quantization_supported();
+      }
       resolved_weight_quant_method = resolved;
+      return;
+    }
+  }
+  if (quant_args.quant_method() == "w4a8_mxfp4") {
+    bool packed = prefixes.empty() ? state_dict.has("weight_packed") : true;
+    for (const auto& prefix : prefixes) {
+      packed = packed && state_dict.has(prefix + "weight_packed");
+    }
+    if (packed) {
+      check_mx_quantization_supported();
+      resolved_weight_quant_method = "w4a8_mxfp4";
+      return;
+    }
+  }
+  if (quant_args.is_compressed_tensors_w8a8_mxfp8()) {
+    bool has_weight = true;
+    for (const auto& prefix : prefixes) {
+      has_weight = has_weight && state_dict.has(prefix + "weight");
+      std::string module = std::string(state_dict.prefix()) + prefix;
+      if (!module.empty() && module.back() == '.') {
+        module.pop_back();
+      }
+      has_weight = has_weight && !quant_args.should_ignore_module(module);
+    }
+    if (has_weight) {
+      check_mx_quantization_supported();
+      resolved_weight_quant_method = kQuantMethodW8A8Mxfp8;
       return;
     }
   }

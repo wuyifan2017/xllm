@@ -310,7 +310,9 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    const torch::Tensor& mx_input_scale) {
+  mx_input_scale_ = mx_input_scale;
   if (attn_metadata.is_dummy) {
     return torch::zeros_like(hidden_states);
   }
@@ -623,14 +625,22 @@ std::optional<
 Qwen3_5GatedDeltaNetImpl::project_split_inputs(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata) {
-  auto qkv = reshape_projected_tokens_with_pad(
-      attn_metadata, in_proj_qkv_->forward(hidden_states));
-  auto z_proj = reshape_projected_tokens_with_pad(
-      attn_metadata, in_proj_z_->forward(hidden_states));
-  auto b_proj = reshape_projected_tokens_with_pad(
-      attn_metadata, in_proj_b_->forward(hidden_states));
-  auto a_proj = reshape_projected_tokens_with_pad(
-      attn_metadata, in_proj_a_->forward(hidden_states));
+  const bool mx_fused = mx_input_scale_.defined();
+  CHECK(!mx_fused || qkv_uses_mxfp8())
+      << "Fused MX input requires all GDN input projections to use MXFP8.";
+  auto project = [&](ColumnParallelLinear& projection) {
+    return mx_fused ? projection->forward_mx_quantized(hidden_states,
+                                                       mx_input_scale_)
+                    : projection->forward(hidden_states);
+  };
+  auto qkv =
+      reshape_projected_tokens_with_pad(attn_metadata, project(in_proj_qkv_));
+  auto z_proj =
+      reshape_projected_tokens_with_pad(attn_metadata, project(in_proj_z_));
+  auto b_proj =
+      reshape_projected_tokens_with_pad(attn_metadata, project(in_proj_b_));
+  auto a_proj =
+      reshape_projected_tokens_with_pad(attn_metadata, project(in_proj_a_));
 
   const int64_t batch_size = qkv.size(0);
   const int64_t seq_len = qkv.size(1);
@@ -639,6 +649,13 @@ Qwen3_5GatedDeltaNetImpl::project_split_inputs(
   auto b = b_proj.view({batch_size, seq_len, num_v_heads_ / tp_size_});
   auto a = a_proj.view({batch_size, seq_len, num_v_heads_ / tp_size_});
   return std::make_tuple(qkv, z, b, a);
+}
+
+bool Qwen3_5GatedDeltaNetImpl::qkv_uses_mxfp8() const {
+  return in_proj_qkv_ && in_proj_qkv_->uses_mxfp8_quant() && in_proj_z_ &&
+         in_proj_z_->uses_mxfp8_quant() && in_proj_b_ &&
+         in_proj_b_->uses_mxfp8_quant() && in_proj_a_ &&
+         in_proj_a_->uses_mxfp8_quant();
 }
 
 void Qwen3_5GatedDeltaNetImpl::load_projection_state_dict(

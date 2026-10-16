@@ -66,6 +66,11 @@ class ColumnParallelLinearImpl : public torch::nn::Module {
 
   torch::Tensor forward_quantized(const W8A8DynamicInput& input);
 
+  // MXFP8 path consuming a pre-quantized (activation, scale) pair, for
+  // callers that fuse the activation quant (e.g. Add+RMSNorm+MX quant).
+  torch::Tensor forward_mx_quantized(const torch::Tensor& quantized_input,
+                                     const torch::Tensor& input_scale);
+
   // load the weight from the checkpoint
   void load_state_dict(const StateDict& state_dict);
 
@@ -88,9 +93,14 @@ class ColumnParallelLinearImpl : public torch::nn::Module {
     }
     return weight_;
   }
+  // Drop the original weight after a fused projection has taken ownership of
+  // its storage. Keep the loaded flag so post-load validation remains valid.
+  void release_weight() { weight_ = torch::empty({0}, weight_.options()); }
   torch::Tensor per_channel_scale() const { return per_channel_scale_; }
   torch::Tensor weight_scale() const { return weight_scale_; }
   bool uses_w8a8_dynamic_quant() const;
+  bool uses_mxfp8_quant() const;
+  bool uses_mxfp4_quant() const;
   torch::Tensor w8a8_dynamic_weight_scale() const;
   std::optional<torch::Tensor> bias() const;
   ProcessGroup* process_group() const { return process_group_; }
@@ -162,6 +172,9 @@ class ColumnParallelLinearImpl : public torch::nn::Module {
   at::ScalarType output_dtype_;
   LinearExtraArgs linear_extra_args_;
   std::optional<std::string> resolved_weight_quant_method_;
+  // BF16 reference decode cache for MXFP4 fallback when the native A5 op is
+  // unavailable. The checkpoint packed tensors remain unchanged.
+  mutable torch::Tensor mxfp4_weight_decoded_;
 #if defined(USE_MUSA)
   bool block_fp8_resolved_unquantized_ = false;
   mutable torch::Tensor matmul_output_buffer_;
@@ -185,6 +198,12 @@ class QKVParallelLinearImpl : public torch::nn::Module {
       const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
 
   torch::Tensor forward(torch::Tensor input);
+
+  // MXFP8 path consuming a pre-quantized (activation, scale) pair.
+  torch::Tensor forward_mx_quantized(const torch::Tensor& quantized_input,
+                                     const torch::Tensor& input_scale);
+
+  bool uses_mxfp8_quant() const;
 
   // load the weight from the checkpoint
   void load_state_dict(const StateDict& state_dict,
@@ -314,6 +333,15 @@ class RowParallelLinearImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor input, RowParallelReduceMode reduce_mode);
 
+  // MXFP8 path consuming a pre-quantized (activation, scale) pair, for
+  // callers that fuse the activation quant (e.g. SiLU-gate + MX quant).
+  torch::Tensor forward_mx_quantized(const torch::Tensor& quantized_input,
+                                     const torch::Tensor& input_scale);
+
+  torch::Tensor forward_mx_quantized(const torch::Tensor& quantized_input,
+                                     const torch::Tensor& input_scale,
+                                     RowParallelReduceMode reduce_mode);
+
   // load the weight from the checkpoint
   void load_state_dict(const StateDict& state_dict);
 
@@ -328,6 +356,8 @@ class RowParallelLinearImpl : public torch::nn::Module {
     }
     return weight_;
   }
+  bool uses_mxfp8_quant() const;
+  bool uses_mxfp4_quant() const;
   torch::Tensor per_channel_scale() const { return per_channel_scale_; }
   std::optional<torch::Tensor> smooth() const {
     if (smooth_is_loaded_) {
@@ -353,6 +383,9 @@ class RowParallelLinearImpl : public torch::nn::Module {
  private:
   torch::Tensor forward_impl(torch::Tensor input,
                              RowParallelReduceMode reduce_mode);
+
+  torch::Tensor apply_row_reduce(torch::Tensor output,
+                                 RowParallelReduceMode reduce_mode);
 
   torch::Tensor mmrs_weight_transposed() const;
 
@@ -401,6 +434,11 @@ class RowParallelLinearImpl : public torch::nn::Module {
   at::ScalarType output_dtype_;
   LinearExtraArgs linear_extra_args_;
   std::optional<std::string> resolved_weight_quant_method_;
+  mutable torch::Tensor mxfp4_weight_decoded_;
+  // Native QuantMatmulV5 layout for MXFP4 down projections. The checkpoint
+  // packs values along K, while the MX kernel packs the output-N pairs.
+  mutable torch::Tensor mxfp4_qmm_weight_;
+  mutable torch::Tensor mxfp4_qmm_scale_;
 #if defined(USE_MUSA)
   bool block_fp8_resolved_unquantized_ = false;
   mutable torch::Tensor matmul_output_buffer_;

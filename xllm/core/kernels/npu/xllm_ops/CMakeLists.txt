@@ -57,3 +57,8 @@ cc_library(
     ${NPU_RUNTIME_SO}
     spdlog::spdlog
 )
+
+add_subdirectory(
+  ${PROJECT_SOURCE_DIR}/third_party/xllm_ops/torch_adapter
+  ${CMAKE_CURRENT_BINARY_DIR}/mx_torch_adapter
+)
